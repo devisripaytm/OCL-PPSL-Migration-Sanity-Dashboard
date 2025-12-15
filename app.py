@@ -258,11 +258,13 @@ def get_gspread_client():
         gspread.Client or None if authentication fails
     """
     if not GSPREAD_AVAILABLE:
+        st.warning("⚠️ gspread library not available. Please install: pip install gspread google-auth")
         return None
     
     try:
         # Check if credentials are in Streamlit secrets
         if "gcp_service_account" not in st.secrets:
+            st.warning("⚠️ 'gcp_service_account' not found in secrets. Please configure secrets in Streamlit Cloud.")
             return None
         
         # Define scopes
@@ -271,9 +273,13 @@ def get_gspread_client():
             "https://www.googleapis.com/auth/drive.readonly"
         ]
         
+        # IMPORTANT: Convert Streamlit secrets object to a plain dictionary
+        # st.secrets returns a special object that needs to be converted for google-auth
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        
         # Create credentials from secrets
         credentials = Credentials.from_service_account_info(
-            st.secrets["gcp_service_account"],
+            creds_dict,
             scopes=scopes
         )
         
@@ -281,8 +287,11 @@ def get_gspread_client():
         client = gspread.authorize(credentials)
         return client
     
+    except KeyError as e:
+        st.error(f"❌ Missing key in service account credentials: {str(e)}")
+        return None
     except Exception as e:
-        st.error(f"Authentication error: {str(e)}")
+        st.error(f"❌ Authentication error: {type(e).__name__}: {str(e)}")
         return None
 
 
@@ -315,9 +324,16 @@ def load_sheet_data_authenticated(_client, sheet_id: str, tab_name: str) -> pd.D
     
     except gspread.exceptions.WorksheetNotFound:
         # Tab doesn't exist - return empty DataFrame
+        st.warning(f"⚠️ Worksheet '{tab_name}' not found in the spreadsheet")
+        return pd.DataFrame()
+    except gspread.exceptions.SpreadsheetNotFound:
+        st.error(f"❌ Spreadsheet not found. Check Sheet ID: {sheet_id[:20]}...")
+        return pd.DataFrame()
+    except gspread.exceptions.APIError as e:
+        st.error(f"❌ Google Sheets API error for '{tab_name}': {str(e)}")
         return pd.DataFrame()
     except Exception as e:
-        # Return empty DataFrame on error
+        st.error(f"❌ Error loading '{tab_name}': {type(e).__name__}: {str(e)}")
         return pd.DataFrame()
 
 
@@ -354,12 +370,14 @@ def load_all_sheets_data(sheet_id: str) -> tuple:
     client = get_gspread_client()
     
     if client:
+        st.sidebar.success("✅ Connected to Google Sheets API")
         # Use authenticated access
         df_ok = load_sheet_data_authenticated(client, sheet_id, SHEET_TABS["ok"])
         df_partial = load_sheet_data_authenticated(client, sheet_id, SHEET_TABS["partial_ok"])
         df_not_ok = load_sheet_data_authenticated(client, sheet_id, SHEET_TABS["not_ok"])
         df_summary = load_sheet_data_authenticated(client, sheet_id, SHEET_TABS["summary"])
     else:
+        st.sidebar.warning("⚠️ Using public URL fallback (no auth)")
         # Fallback to public URL method
         df_ok = load_sheet_data_public(sheet_id, SHEET_TABS["ok"])
         df_partial = load_sheet_data_public(sheet_id, SHEET_TABS["partial_ok"])
@@ -684,6 +702,199 @@ def create_success_rate_chart(run_history):
     )
     
     return fig
+
+
+# =============================================================================
+# SOURCE TYPE BREAKDOWN FUNCTIONS
+# =============================================================================
+
+def get_source_type_column(df):
+    """Find the source type column in dataframe."""
+    possible_cols = ['old_source_type', 'Old Source Type', 'old source type', 'source_type', 'Source Type']
+    for col in possible_cols:
+        if col in df.columns:
+            return col
+    return None
+
+
+def create_source_type_overview_table(df_ok, df_partial, df_not_ok):
+    """Create a table showing counts by source type across OK but need attention and Not OK categories."""
+    source_data = {}
+    
+    # Only include OK but need attention and Not OK (exclude OK)
+    for df, category in [(df_partial, 'OK but need attention'), (df_not_ok, 'Not OK')]:
+        if df is None or df.empty:
+            continue
+        
+        source_col = get_source_type_column(df)
+        if source_col is None:
+            continue
+        
+        # Get unique dataset counts per source type
+        df_copy = df.copy()
+        df_copy[source_col] = df_copy[source_col].fillna('Unknown').astype(str)
+        source_counts = df_copy.groupby(source_col)['Dataset ID'].nunique()
+        
+        for source_type, count in source_counts.items():
+            if source_type not in source_data:
+                source_data[source_type] = {'OK but need attention': 0, 'Not OK': 0}
+            source_data[source_type][category] = count
+    
+    if not source_data:
+        return None
+    
+    # Create DataFrame
+    rows = []
+    for source_type, counts in source_data.items():
+        rows.append({
+            'Source Type': source_type,
+            'OK but need attention': counts['OK but need attention'],
+            'Not OK': counts['Not OK'],
+            'Total': counts['OK but need attention'] + counts['Not OK']
+        })
+    
+    result_df = pd.DataFrame(rows)
+    result_df = result_df.sort_values('Total', ascending=False)
+    
+    # Add total row
+    total_row = pd.DataFrame([{
+        'Source Type': '**Total**',
+        'OK but need attention': result_df['OK but need attention'].sum(),
+        'Not OK': result_df['Not OK'].sum(),
+        'Total': result_df['Total'].sum()
+    }])
+    
+    result_df = pd.concat([result_df, total_row], ignore_index=True)
+    
+    return result_df
+
+
+def create_source_type_pie_chart(df, title, color_scheme=None):
+    """Create a colorful pie chart for source type distribution."""
+    if df is None or df.empty:
+        return None
+    
+    source_col = get_source_type_column(df)
+    if source_col is None:
+        return None
+    
+    df_copy = df.copy()
+    df_copy[source_col] = df_copy[source_col].fillna('Unknown').astype(str)
+    
+    # Get unique dataset counts per source type
+    source_counts = df_copy.groupby(source_col)['Dataset ID'].nunique().reset_index()
+    source_counts.columns = ['Source Type', 'Count']
+    source_counts = source_counts.sort_values('Count', ascending=False)
+    
+    if source_counts.empty:
+        return None
+    
+    # Use a colorful palette
+    if color_scheme is None:
+        color_scheme = px.colors.qualitative.Set3 + px.colors.qualitative.Pastel1 + px.colors.qualitative.Bold
+    
+    fig = go.Figure(data=[go.Pie(
+        labels=source_counts['Source Type'],
+        values=source_counts['Count'],
+        hole=0.4,
+        marker_colors=color_scheme[:len(source_counts)],
+        textinfo='label+percent',
+        textfont_size=11,
+        textfont_color='white',
+        hovertemplate="<b>%{label}</b><br>Count: %{value:,}<br>Percentage: %{percent}<extra></extra>"
+    )])
+    
+    total_count = source_counts['Count'].sum()
+    
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=18, color='white')),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='white'),
+        showlegend=True,
+        legend=dict(
+            orientation="v",
+            yanchor="middle",
+            y=0.5,
+            xanchor="left",
+            x=1.05,
+            font=dict(size=11)
+        ),
+        annotations=[dict(
+            text=f'{total_count:,}<br>Total',
+            x=0.5, y=0.5,
+            font_size=16,
+            font_color='white',
+            showarrow=False
+        )],
+        height=450,
+        margin=dict(l=20, r=120, t=60, b=20)
+    )
+    
+    return fig
+
+
+def create_source_type_case_breakdown(df, case_count, title):
+    """Create source type breakdown with case-wise counts."""
+    if df is None or df.empty:
+        return None
+    
+    source_col = get_source_type_column(df)
+    reason_col = next((c for c in ['Sanity reason', 'sanity reason', 'sanity_reason', 'Sanity Reason'] if c in df.columns), None)
+    
+    if source_col is None or reason_col is None:
+        return None
+    
+    df_copy = df.copy()
+    df_copy[source_col] = df_copy[source_col].fillna('Unknown').astype(str)
+    df_copy['Case'] = df_copy[reason_col].apply(extract_case_number)
+    df_copy = df_copy[df_copy['Case'].notna()]
+    
+    if df_copy.empty:
+        return None
+    
+    # Get unique source types
+    source_types = df_copy[source_col].unique()
+    
+    # Build the breakdown
+    rows = []
+    for source_type in source_types:
+        source_df = df_copy[df_copy[source_col] == source_type]
+        row = {'Source Type': source_type}
+        
+        # Count unique datasets per case
+        total_datasets = source_df['Dataset ID'].nunique()
+        row['Total'] = total_datasets
+        
+        for i in range(1, case_count + 1):
+            case_name = f'Case {i}'
+            case_df = source_df[source_df['Case'] == case_name]
+            row[case_name] = case_df['Dataset ID'].nunique()
+        
+        rows.append(row)
+    
+    result_df = pd.DataFrame(rows)
+    result_df = result_df.sort_values('Total', ascending=False)
+    
+    # Calculate % of Total
+    grand_total = result_df['Total'].sum()
+    result_df['% of Total'] = (result_df['Total'] / grand_total * 100).round(1).astype(str) + '%'
+    
+    # Add total row
+    total_row = {'Source Type': '**Total**', 'Total': grand_total, '% of Total': '100%'}
+    for i in range(1, case_count + 1):
+        case_name = f'Case {i}'
+        if case_name in result_df.columns:
+            total_row[case_name] = result_df[case_name].sum()
+    
+    result_df = pd.concat([result_df, pd.DataFrame([total_row])], ignore_index=True)
+    
+    # Reorder columns
+    cols = ['Source Type', 'Total'] + [f'Case {i}' for i in range(1, case_count + 1)] + ['% of Total']
+    cols = [c for c in cols if c in result_df.columns]
+    result_df = result_df[cols]
+    
+    return result_df
 
 
 # =============================================================================
@@ -1396,6 +1607,42 @@ def main():
             if fig_max_date:
                 st.plotly_chart(fig_max_date, use_container_width=True)
         
+        # Row 4: Source Type Overview Table
+        st.markdown("---")
+        st.markdown("### 📊 Group by Source Type")
+        
+        source_type_overview = create_source_type_overview_table(df_ok, df_partial, df_not_ok)
+        if source_type_overview is not None:
+            st.dataframe(source_type_overview, use_container_width=True, hide_index=True)
+        else:
+            st.info("ℹ️ Source type information not available in the data.")
+        
+        # Row 5: Source Type Pie Charts
+        st.markdown("---")
+        st.markdown("### 🎨 Source Type Distribution")
+        
+        pie_col1, pie_col2 = st.columns(2)
+        
+        with pie_col1:
+            # OK but need attention source type pie chart
+            fig_partial_pie = create_source_type_pie_chart(
+                df_partial, 
+                "OK but need attention - Source Types",
+                px.colors.qualitative.Set2
+            )
+            if fig_partial_pie:
+                st.plotly_chart(fig_partial_pie, use_container_width=True)
+        
+        with pie_col2:
+            # Not OK source type pie chart
+            fig_notok_pie = create_source_type_pie_chart(
+                df_not_ok, 
+                "Not OK - Source Types",
+                px.colors.qualitative.Set1
+            )
+            if fig_notok_pie:
+                st.plotly_chart(fig_notok_pie, use_container_width=True)
+        
         # Export all data
         st.markdown("---")
         st.markdown("### 📥 Export Full Report")
@@ -1487,6 +1734,28 @@ def main():
             case_data['Next Steps'] = case_data['Case'].map(OK_BUT_NEED_ATTENTION_NEXT_STEPS).fillna('')
             create_case_distribution_table_with_next_steps(case_data, total, "Case-wise Distribution (OK but need attention Datasets)")
             st.markdown("---")
+        
+        # Source Type Section - Pie Chart and Table
+        st.markdown("#### 🎨 Source Type Distribution")
+        
+        # Pie chart (full width)
+        fig_partial_source = create_source_type_pie_chart(
+            df_partial, 
+            "Source Type Distribution - OK but need attention",
+            px.colors.qualitative.Pastel
+        )
+        if fig_partial_source:
+            st.plotly_chart(fig_partial_source, use_container_width=True)
+        
+        st.markdown("#### 📊 Source Type Breakdown by Case")
+        # Case-wise breakdown table (full width)
+        source_breakdown_partial = create_source_type_case_breakdown(df_partial, case_count=6, title="OK but need attention Datasets")
+        if source_breakdown_partial is not None:
+            st.dataframe(source_breakdown_partial, use_container_width=True, hide_index=True, height=400)
+        else:
+            st.info("ℹ️ Source type breakdown not available.")
+        
+        st.markdown("---")
         
         # Filters - Row 1
         with st.expander("🔍 Filters", expanded=True):
@@ -1603,6 +1872,28 @@ def main():
             create_case_distribution_table(case_data, total, "Case-wise Distribution (Not OK Datasets)")
             st.markdown("---")
         
+        # Source Type Section - Pie Chart and Table
+        st.markdown("#### 🎨 Source Type Distribution")
+        
+        # Pie chart (full width)
+        fig_notok_source = create_source_type_pie_chart(
+            df_not_ok, 
+            "Source Type Distribution - Not OK",
+            px.colors.qualitative.Bold
+        )
+        if fig_notok_source:
+            st.plotly_chart(fig_notok_source, use_container_width=True)
+        
+        st.markdown("#### 📊 Source Type Breakdown by Case")
+        # Case-wise breakdown table (full width)
+        source_breakdown_notok = create_source_type_case_breakdown(df_not_ok, case_count=13, title="Not OK Datasets")
+        if source_breakdown_notok is not None:
+            st.dataframe(source_breakdown_notok, use_container_width=True, hide_index=True, height=400)
+        else:
+            st.info("ℹ️ Source type breakdown not available.")
+        
+        st.markdown("---")
+        
         # Filters - Row 1
         with st.expander("🔍 Filters", expanded=True):
             col1, col2, col3, col4 = st.columns(4)
@@ -1713,67 +2004,149 @@ def main():
         st.markdown("### 📈 Not OK Summary Analysis")
         st.markdown("---")
         
+        # Calculate summary statistics from actual data (fixes N/A issue)
+        st.markdown("#### 📊 Summary Statistics")
+        
+        # Calculate % Data Match and % Data Unmatch from actual counts
+        total_datasets_calc = ok_count + partial_count + not_ok_count
+        pct_data_match = (ok_count / total_datasets_calc * 100) if total_datasets_calc > 0 else 0
+        pct_data_unmatch = (not_ok_count / total_datasets_calc * 100) if total_datasets_calc > 0 else 0
+        
+        # Calculate average % date match/unmatch from Not OK summary if available
+        avg_date_match = 0
+        avg_date_unmatch = 0
+        
+        if df_summary is not None and not df_summary.empty:
+            # Find date match column
+            date_match_col = next((c for c in ['% date match', '% Date Match', 'date_match_pct'] if c in df_summary.columns), None)
+            date_unmatch_col = next((c for c in ['% date unmatch', '% Date Unmatch', 'date_unmatch_pct'] if c in df_summary.columns), None)
+            
+            if date_match_col:
+                # Clean and convert to numeric (remove % signs if present)
+                df_temp = df_summary.copy()
+                df_temp[date_match_col] = df_temp[date_match_col].astype(str).str.replace('%', '').str.strip()
+                df_temp[date_match_col] = pd.to_numeric(df_temp[date_match_col], errors='coerce')
+                avg_date_match = df_temp[date_match_col].mean()
+                if pd.isna(avg_date_match):
+                    avg_date_match = 0
+            
+            if date_unmatch_col:
+                df_temp = df_summary.copy()
+                df_temp[date_unmatch_col] = df_temp[date_unmatch_col].astype(str).str.replace('%', '').str.strip()
+                df_temp[date_unmatch_col] = pd.to_numeric(df_temp[date_unmatch_col], errors='coerce')
+                avg_date_unmatch = df_temp[date_unmatch_col].mean()
+                if pd.isna(avg_date_unmatch):
+                    avg_date_unmatch = 0
+        
+        # Display 4 summary metrics
+        metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+        
+        with metric_col1:
+            st.metric("% Data Match", f"{pct_data_match:.1f}%", help="OK datasets / Total datasets")
+        with metric_col2:
+            st.metric("% Data Unmatch", f"{pct_data_unmatch:.1f}%", help="Not OK datasets / Total datasets")
+        with metric_col3:
+            st.metric("% Avg Date Match", f"{avg_date_match:.1f}%", help="Average % date match across Not OK datasets")
+        with metric_col4:
+            st.metric("% Avg Date Unmatch", f"{avg_date_unmatch:.1f}%", help="Average % date unmatch across Not OK datasets")
+        
+        st.markdown("---")
+        
         if df_summary is None or df_summary.empty:
-            st.warning("⚠️ No summary file uploaded. Please upload not_ok_summary.csv to view this section.")
+            st.warning("⚠️ No summary file uploaded. Please upload not_ok_summary.csv to view detailed analysis.")
         else:
-            # Display summary stats
-            st.markdown("#### 📊 Summary Statistics")
+            # 6 New Filters for Summary Tab
+            st.markdown("#### 🔍 Filters")
             
-            # Show available columns for debugging
-            st.caption(f"Available columns: {', '.join(df_summary.columns.tolist())}")
+            filter_col1, filter_col2, filter_col3 = st.columns(3)
+            filter_col4, filter_col5, filter_col6 = st.columns(3)
             
-            # Look for percentage columns with flexible matching
-            numeric_cols_mapping = {
-                '% date match': ['% date match', '% Date Match', 'date_match_pct', 'date match %'],
-                '% date unmatch': ['% date unmatch', '% Date Unmatch', 'date_unmatch_pct', 'date unmatch %'],
-                '% data match': ['% data match', '% Data Match', 'data_match_pct', 'data match %'],
-                '% data unmatch': ['% data unmatch', '% Data Unmatch', 'data_unmatch_pct', 'data unmatch %']
-            }
+            with filter_col1:
+                # Ingest Type filter (from df_not_ok)
+                ingest_options = ['All']
+                ingest_col_notok = next((c for c in ['Ingest type', 'Ingestion type', 'ingest_type'] if c in df_not_ok.columns), None)
+                if ingest_col_notok:
+                    ingest_options += list(df_not_ok[ingest_col_notok].dropna().unique())
+                summary_ingest_filter = st.selectbox("Ingest Type", options=ingest_options, key="summary_ingest")
             
-            found_cols = {}
-            for display_name, possible_names in numeric_cols_mapping.items():
-                for col_name in possible_names:
-                    if col_name in df_summary.columns:
-                        found_cols[display_name] = col_name
-                        break
+            with filter_col2:
+                # Status Flag filter
+                status_options = ['All']
+                status_col_notok = next((c for c in ['Status flag', 'status_flag', 'Status Flag'] if c in df_not_ok.columns), None)
+                if status_col_notok:
+                    status_options += list(df_not_ok[status_col_notok].dropna().unique())
+                summary_status_filter = st.selectbox("Status Flag", options=status_options, key="summary_status")
             
-            if found_cols:
-                # Create a copy for display
-                summary_display = df_summary.copy()
-                
-                # Convert to numeric for statistics
-                for display_name, actual_col in found_cols.items():
-                    summary_display[actual_col] = pd.to_numeric(summary_display[actual_col], errors='coerce')
-                
-                # Filter out rows with all NaN values in these columns
-                valid_rows = summary_display[[v for v in found_cols.values()]].notna().any(axis=1)
-                summary_display = summary_display[valid_rows]
-                
-                # Show statistics
-                cols = st.columns(len(found_cols))
-                
-                for i, (display_name, actual_col) in enumerate(found_cols.items()):
-                    with cols[i]:
-                        mean_val = summary_display[actual_col].mean()
-                        if pd.notna(mean_val):
-                            st.metric(display_name, f"{mean_val:.1f}%")
-                        else:
-                            st.metric(display_name, "N/A")
-            else:
-                st.info("ℹ️ No percentage columns found in summary data. Expected columns: % date match, % data match, etc.")
+            with filter_col3:
+                # Old Status filter
+                old_status_options = ['All']
+                old_status_col_notok = next((c for c in ['Old status', 'old_status', 'Old Status'] if c in df_not_ok.columns), None)
+                if old_status_col_notok:
+                    old_status_options += list(df_not_ok[old_status_col_notok].dropna().unique())
+                summary_old_status_filter = st.selectbox("Old Status", options=old_status_options, key="summary_old_status")
+            
+            with filter_col4:
+                # New Status filter
+                new_status_options = ['All']
+                new_status_col_notok = next((c for c in ['New status', 'new_status', 'New Status'] if c in df_not_ok.columns), None)
+                if new_status_col_notok:
+                    new_status_options += list(df_not_ok[new_status_col_notok].dropna().unique())
+                summary_new_status_filter = st.selectbox("New Status", options=new_status_options, key="summary_new_status")
+            
+            with filter_col5:
+                # Old Source Type filter
+                old_source_options = ['All']
+                old_source_col_notok = next((c for c in ['old_source_type', 'Old Source Type', 'old source type'] if c in df_not_ok.columns), None)
+                if old_source_col_notok:
+                    old_source_options += list(df_not_ok[old_source_col_notok].dropna().unique())
+                summary_old_source_filter = st.selectbox("Old Source Type", options=old_source_options, key="summary_old_source")
+            
+            with filter_col6:
+                # New Source Type filter
+                new_source_options = ['All']
+                new_source_col_notok = next((c for c in ['new_source_type', 'New Source Type', 'new source type'] if c in df_not_ok.columns), None)
+                if new_source_col_notok:
+                    new_source_options += list(df_not_ok[new_source_col_notok].dropna().unique())
+                summary_new_source_filter = st.selectbox("New Source Type", options=new_source_options, key="summary_new_source")
             
             st.markdown("---")
+            
+            # Apply filters to get filtered dataset IDs from df_not_ok
+            filtered_not_ok_for_summary = df_not_ok.copy()
+            
+            if summary_ingest_filter != 'All' and ingest_col_notok:
+                filtered_not_ok_for_summary = filtered_not_ok_for_summary[filtered_not_ok_for_summary[ingest_col_notok] == summary_ingest_filter]
+            if summary_status_filter != 'All' and status_col_notok:
+                filtered_not_ok_for_summary = filtered_not_ok_for_summary[filtered_not_ok_for_summary[status_col_notok] == summary_status_filter]
+            if summary_old_status_filter != 'All' and old_status_col_notok:
+                filtered_not_ok_for_summary = filtered_not_ok_for_summary[filtered_not_ok_for_summary[old_status_col_notok] == summary_old_status_filter]
+            if summary_new_status_filter != 'All' and new_status_col_notok:
+                filtered_not_ok_for_summary = filtered_not_ok_for_summary[filtered_not_ok_for_summary[new_status_col_notok] == summary_new_status_filter]
+            if summary_old_source_filter != 'All' and old_source_col_notok:
+                filtered_not_ok_for_summary = filtered_not_ok_for_summary[filtered_not_ok_for_summary[old_source_col_notok] == summary_old_source_filter]
+            if summary_new_source_filter != 'All' and new_source_col_notok:
+                filtered_not_ok_for_summary = filtered_not_ok_for_summary[filtered_not_ok_for_summary[new_source_col_notok] == summary_new_source_filter]
+            
+            # Get filtered dataset IDs
+            filtered_dataset_ids = filtered_not_ok_for_summary['Dataset ID'].unique() if 'Dataset ID' in filtered_not_ok_for_summary.columns else []
+            
+            # Filter summary by dataset IDs
+            filtered_summary = df_summary.copy()
+            if len(filtered_dataset_ids) > 0 and 'Dataset ID' in filtered_summary.columns:
+                filtered_summary = filtered_summary[filtered_summary['Dataset ID'].isin(filtered_dataset_ids)]
+            
+            st.caption(f"Showing {len(filtered_summary):,} records after filtering")
             
             # Charts
             col1, col2 = st.columns(2)
             
             with col1:
-                fig_hist = create_data_match_histogram(df_summary)
+                fig_hist = create_data_match_histogram(filtered_summary)
                 if fig_hist:
                     st.plotly_chart(fig_hist, use_container_width=True)
             
             with col2:
-                fig_scatter = create_match_scatter(df_summary)
+                fig_scatter = create_match_scatter(filtered_summary)
                 if fig_scatter:
                     st.plotly_chart(fig_scatter, use_container_width=True)
             
@@ -1782,12 +2155,12 @@ def main():
             # Full summary table
             st.markdown("#### 📋 Full Summary Table")
             
-            # Filters
+            # Search filter
             col1, col2 = st.columns([1, 3])
             with col1:
                 search_summary = st.text_input("Search Dataset ID", key="search_summary", placeholder="Enter Dataset ID...")
             
-            filtered_summary = df_summary.copy()
+            # Apply search to already filtered summary
             if search_summary:
                 filtered_summary = search_dataset(filtered_summary, search_summary)
             
@@ -1797,13 +2170,16 @@ def main():
             st.markdown("---")
             st.markdown("#### ⚠️ Lowest Match Datasets")
             
-            data_match_col = next((c for c in ['% data match', 'data_match_pct'] if c in df_summary.columns), None)
-            if data_match_col:
-                df_sorted = df_summary.copy()
-                df_sorted[data_match_col] = pd.to_numeric(df_sorted[data_match_col], errors='coerce')
-                df_sorted = df_sorted.dropna(subset=[data_match_col])
-                df_sorted = df_sorted.nsmallest(10, data_match_col)
+            date_match_col_summary = next((c for c in ['% date match', '% Date Match', 'date_match_pct'] if c in filtered_summary.columns), None)
+            if date_match_col_summary:
+                df_sorted = filtered_summary.copy()
+                df_sorted[date_match_col_summary] = df_sorted[date_match_col_summary].astype(str).str.replace('%', '').str.strip()
+                df_sorted[date_match_col_summary] = pd.to_numeric(df_sorted[date_match_col_summary], errors='coerce')
+                df_sorted = df_sorted.dropna(subset=[date_match_col_summary])
+                df_sorted = df_sorted.nsmallest(10, date_match_col_summary)
                 st.dataframe(df_sorted, use_container_width=True)
+            else:
+                st.info("ℹ️ No date match column found in summary data.")
             
             # Download
             st.download_button(
