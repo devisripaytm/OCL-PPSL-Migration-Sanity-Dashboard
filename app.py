@@ -53,7 +53,7 @@ CACHE_TTL = 300
 # =============================================================================
 COLORS = {
     "ok": "#10B981",           # Emerald green
-    "partial_ok": "#F59E0B",   # Amber
+    "partial_ok": "#F59E0B",   # Amber (OK but need attention)
     "not_ok": "#EF4444",       # Red
     "primary": "#3B82F6",      # Blue
     "secondary": "#6B7280",    # Gray
@@ -70,7 +70,8 @@ OK_CASE_DESCRIPTIONS = {
     "Case 2": "Not FULL, max date match, status match"
 }
 
-PARTIAL_OK_CASE_DESCRIPTIONS = {
+# Renamed from PARTIAL_OK to OK_BUT_NEED_ATTENTION
+OK_BUT_NEED_ATTENTION_CASE_DESCRIPTIONS = {
     "Case 1": "Not FULL, only last date not matching",
     "Case 2": "FULL, status mismatch, count match",
     "Case 3": "Not FULL, status mismatch, count match",
@@ -78,6 +79,19 @@ PARTIAL_OK_CASE_DESCRIPTIONS = {
     "Case 5": "Max date mismatch, last date not match",
     "Case 6": "Zero counts (0=0), no data in S3"
 }
+
+# Next Steps Suggested for "OK but need attention" cases
+OK_BUT_NEED_ATTENTION_NEXT_STEPS = {
+    "Case 1": "NA. Acceptable.",
+    "Case 2": "Manual checking required. Make status same at both places (Inactive at new OCL).",
+    "Case 3": "Manual checking required. Make status same at both places (Inactive at new OCL).",
+    "Case 4": "Not possible. Manual check. P0. May need to inactive dataset at one place.",
+    "Case 5": "Manual check case.",
+    "Case 6": "No counts in both. Dependent on backend engineering to check S3 manifest."
+}
+
+# Keep old name for backward compatibility
+PARTIAL_OK_CASE_DESCRIPTIONS = OK_BUT_NEED_ATTENTION_CASE_DESCRIPTIONS
 
 NOT_OK_CASE_DESCRIPTIONS = {
     "Case 1": "FULL, count mismatch",
@@ -389,26 +403,18 @@ def get_unique_dataset_count(df, id_column="Dataset ID"):
     return df[id_column].nunique()
 
 
-def create_metric_card(icon, label, value, color):
-    """Create a styled metric card."""
-    return f"""
-    <div class="metric-card">
-        <div class="metric-icon">{icon}</div>
-        <div class="metric-value" style="color: {color};">{value:,}</div>
-        <div class="metric-label">{label}</div>
-    </div>
-    """
+def create_metric_card(icon, label, value, color, percentage=None):
+    """Create a styled metric card with optional percentage."""
+    if percentage is not None:
+        percentage_html = f'<div style="color: #94a3b8; font-size: 0.9rem; margin-top: 4px;">({percentage:.1f}%)</div>'
+    else:
+        percentage_html = ''
+    return f'<div class="metric-card"><div class="metric-icon">{icon}</div><div class="metric-value" style="color: {color};">{value:,}</div>{percentage_html}<div class="metric-label">{label}</div></div>'
 
 
 def create_percentage_card(icon, label, value, color):
     """Create a styled percentage metric card."""
-    return f"""
-    <div class="metric-card">
-        <div class="metric-icon">{icon}</div>
-        <div class="metric-value" style="color: {color};">{value:.1f}%</div>
-        <div class="metric-label">{label}</div>
-    </div>
-    """
+    return f'<div class="metric-card"><div class="metric-icon">{icon}</div><div class="metric-value" style="color: {color};">{value:.1f}%</div><div class="metric-label">{label}</div></div>'
 
 
 @st.cache_data
@@ -502,7 +508,7 @@ def get_success_rate_by_run(df_ok, df_partial, df_not_ok):
     all_data = []
     date_col_name = None
     
-    for df, status in [(df_ok, 'OK'), (df_partial, 'Partial OK'), (df_not_ok, 'Not OK')]:
+    for df, status in [(df_ok, 'OK'), (df_partial, 'OK but need attention'), (df_not_ok, 'Not OK')]:
         if df is None or df.empty:
             continue
         
@@ -533,12 +539,12 @@ def get_success_rate_by_run(df_ok, df_partial, df_not_ok):
         lambda x: pd.Series({
             'Total': x['Dataset ID'].nunique(),
             'OK': (x['validation_status'] == 'OK').sum(),
-            'Partial OK': (x['validation_status'] == 'Partial OK').sum(),
+            'OK but need attention': (x['validation_status'] == 'OK but need attention').sum(),
             'Not OK': (x['validation_status'] == 'Not OK').sum()
         })
     ).reset_index()
     
-    run_summary.columns = ['Sanity Run Date', 'Total', 'OK', 'Partial OK', 'Not OK']
+    run_summary.columns = ['Sanity Run Date', 'Total', 'OK', 'OK but need attention', 'Not OK']
     run_summary['Success Rate (%)'] = (run_summary['OK'] / run_summary['Total'] * 100).round(2)
     run_summary = run_summary.sort_values('Sanity Run Date', ascending=False)
     
@@ -568,6 +574,60 @@ def create_case_distribution_table(case_data, total, title):
         })
         if 'Description' not in display_df.columns:
             total_row = total_row.drop('Description', axis=1)
+        
+        display_df = pd.concat([display_df, total_row], ignore_index=True)
+        st.dataframe(display_df, use_container_width=True, hide_index=True)
+    
+    with col2:
+        # Bar chart
+        fig = px.bar(
+            case_data,
+            x='Case',
+            y='Count',
+            color='Case',
+            color_discrete_sequence=CASE_COLORS,
+            text='Count'
+        )
+        fig.update_traces(textposition='outside', textfont_size=11)
+        fig.update_layout(
+            title=dict(text="Case Distribution", font=dict(size=14, color='white')),
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            font=dict(color='white'),
+            xaxis=dict(title="", gridcolor='rgba(255,255,255,0.1)'),
+            yaxis=dict(title="Count", gridcolor='rgba(255,255,255,0.1)'),
+            showlegend=False,
+            height=300
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+
+def create_case_distribution_table_with_next_steps(case_data, total, title):
+    """Create a styled case distribution section with table, chart, and Next Steps column."""
+    if case_data is None:
+        return
+    
+    st.markdown(f"#### 📊 {title}")
+    
+    col1, col2 = st.columns([3, 2])
+    
+    with col1:
+        # Display table with Next Steps
+        display_df = case_data.copy()
+        display_df['Percentage'] = display_df['Percentage'].apply(lambda x: f"{x}%")
+        
+        # Reorder columns to show Next Steps
+        cols_order = ['Case', 'Description', 'Count', 'Percentage', 'Next Steps']
+        cols_order = [c for c in cols_order if c in display_df.columns]
+        display_df = display_df[cols_order]
+        
+        # Add total row
+        total_row_data = {'Case': ['**Total**'], 'Count': [total], 'Percentage': ['100%']}
+        if 'Description' in display_df.columns:
+            total_row_data['Description'] = ['']
+        if 'Next Steps' in display_df.columns:
+            total_row_data['Next Steps'] = ['']
+        total_row = pd.DataFrame(total_row_data)
         
         display_df = pd.concat([display_df, total_row], ignore_index=True)
         st.dataframe(display_df, use_container_width=True, hide_index=True)
@@ -631,14 +691,14 @@ def create_success_rate_chart(run_history):
 # =============================================================================
 
 def create_distribution_pie(ok_count, partial_count, not_ok_count):
-    """Create pie chart for OK/Partial/Not OK distribution."""
+    """Create pie chart for OK/OK but need attention/Not OK distribution."""
     fig = go.Figure(data=[go.Pie(
-        labels=['OK', 'Partial OK', 'Not OK'],
+        labels=['OK', 'OK but need attention', 'Not OK'],
         values=[ok_count, partial_count, not_ok_count],
         hole=0.5,
         marker_colors=[COLORS['ok'], COLORS['partial_ok'], COLORS['not_ok']],
         textinfo='label+percent',
-        textfont_size=14,
+        textfont_size=12,
         textfont_color='white',
         hovertemplate="<b>%{label}</b><br>Count: %{value:,}<br>Percentage: %{percent}<extra></extra>"
     )])
@@ -668,7 +728,7 @@ def create_distribution_pie(ok_count, partial_count, not_ok_count):
 
 
 def create_case_distribution_bar(df, case_column='Sanity reason'):
-    """Create bar chart for case distribution."""
+    """Create bar chart for case distribution with category color coding."""
     # Find the correct column name
     possible_cols = ['Sanity reason', 'sanity reason', 'sanity_reason', 'Sanity Reason']
     col_name = None
@@ -688,29 +748,95 @@ def create_case_distribution_bar(df, case_column='Sanity reason'):
     if df_copy.empty:
         return None
     
-    case_counts = df_copy['Case'].value_counts().reset_index()
-    case_counts.columns = ['Case', 'Count']
-    case_counts = case_counts.sort_values('Case')
+    # Check if Category column exists (from combined dataframe)
+    has_category = 'Category' in df_copy.columns
     
-    fig = px.bar(
-        case_counts,
-        x='Case',
-        y='Count',
-        color='Case',
-        color_discrete_sequence=CASE_COLORS,
-        text='Count'
-    )
+    if has_category:
+        # Create case label with category prefix
+        def get_case_label(row):
+            case = row['Case']
+            category = row['Category']
+            case_num = case.replace('Case ', '') if case else ''
+            if category == 'OK':
+                return f"OK-{case_num}"
+            elif category == 'OK but need attention':
+                return f"Attn-{case_num}"
+            else:  # Not OK
+                return f"NotOK-{case_num}"
+        
+        df_copy['CaseLabel'] = df_copy.apply(get_case_label, axis=1)
+        
+        # Count by CaseLabel and Category
+        case_counts = df_copy.groupby(['CaseLabel', 'Category']).size().reset_index(name='Count')
+        
+        # Define category colors
+        category_colors = {
+            'OK': COLORS['ok'],
+            'OK but need attention': COLORS['partial_ok'],
+            'Not OK': COLORS['not_ok']
+        }
+        
+        # Sort by category order and then case number
+        category_order = {'OK': 0, 'OK but need attention': 1, 'Not OK': 2}
+        case_counts['SortOrder'] = case_counts['Category'].map(category_order)
+        case_counts['CaseNum'] = case_counts['CaseLabel'].str.extract(r'(\d+)').astype(int)
+        case_counts = case_counts.sort_values(['SortOrder', 'CaseNum'])
+        
+        fig = px.bar(
+            case_counts,
+            x='CaseLabel',
+            y='Count',
+            color='Category',
+            color_discrete_map=category_colors,
+            text='Count',
+            category_orders={'CaseLabel': case_counts['CaseLabel'].tolist()}
+        )
+        
+        fig.update_traces(textposition='outside', textfont_size=11)
+        fig.update_layout(
+            title=dict(text="Case-wise Distribution by Category", font=dict(size=18, color='white')),
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            font=dict(color='white'),
+            xaxis=dict(title="Case", gridcolor='rgba(255,255,255,0.1)', tickangle=-45),
+            yaxis=dict(title="Count", gridcolor='rgba(255,255,255,0.1)'),
+            legend=dict(
+                title="Category",
+                orientation="h",
+                yanchor="bottom",
+                y=1.02,
+                xanchor="center",
+                x=0.5,
+                bgcolor='rgba(0,0,0,0.5)'
+            ),
+            showlegend=True
+        )
+    else:
+        # Fallback to original behavior if no category column
+        case_counts = df_copy['Case'].value_counts().reset_index()
+        case_counts.columns = ['Case', 'Count']
+        case_counts = case_counts.sort_values('Case')
+        
+        fig = px.bar(
+            case_counts,
+            x='Case',
+            y='Count',
+            color='Case',
+            color_discrete_sequence=CASE_COLORS,
+            text='Count'
+        )
+        
+        fig.update_traces(textposition='outside', textfont_size=12)
+        fig.update_layout(
+            title=dict(text="Case-wise Distribution", font=dict(size=18, color='white')),
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            font=dict(color='white'),
+            xaxis=dict(title="Case", gridcolor='rgba(255,255,255,0.1)'),
+            yaxis=dict(title="Count", gridcolor='rgba(255,255,255,0.1)'),
+            showlegend=False
+        )
     
-    fig.update_traces(textposition='outside', textfont_size=12)
-    fig.update_layout(
-        title=dict(text="Case-wise Distribution", font=dict(size=18, color='white')),
-        paper_bgcolor='rgba(0,0,0,0)',
-        plot_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='white'),
-        xaxis=dict(title="Case", gridcolor='rgba(255,255,255,0.1)'),
-        yaxis=dict(title="Count", gridcolor='rgba(255,255,255,0.1)'),
-        showlegend=False
-    )
     return fig
 
 
@@ -718,7 +844,7 @@ def create_ingest_type_bar(df_ok, df_partial, df_not_ok):
     """Create bar chart for ingest type distribution."""
     data = []
     
-    for df, category in [(df_ok, 'OK'), (df_partial, 'Partial OK'), (df_not_ok, 'Not OK')]:
+    for df, category in [(df_ok, 'OK'), (df_partial, 'OK but need attention'), (df_not_ok, 'Not OK')]:
         if df is not None and not df.empty:
             # Find ingest type column
             ingest_col = None
@@ -809,7 +935,7 @@ def create_max_date_bar(df_partial, df_not_ok):
     """Create bar chart for max date matching distribution."""
     data = []
     
-    for df, category in [(df_partial, 'Partial OK'), (df_not_ok, 'Not OK')]:
+    for df, category in [(df_partial, 'OK but need attention'), (df_not_ok, 'Not OK')]:
         if df is not None and not df.empty:
             max_date_col = None
             for col in ['Max date not matching', 'max_date_matching', 'Max Date']:
@@ -1011,9 +1137,9 @@ def main():
                 st.error("❌ OK: Failed to load")
             
             if partial_loaded:
-                st.success(f"✅ Partial OK: {len(df_partial):,} rows")
+                st.success(f"✅ OK but need attention: {len(df_partial):,} rows")
             else:
-                st.error("❌ Partial OK: Failed to load")
+                st.error("❌ OK but need attention: Failed to load")
             
             if not_ok_loaded:
                 st.success(f"✅ Not OK: {len(df_not_ok):,} rows")
@@ -1039,7 +1165,7 @@ def main():
             )
             
             partial_file = st.file_uploader(
-                "⚠️ Partial OK Datasets",
+                "⚠️ OK but need attention Datasets",
                 type="csv",
                 key="partial",
                 help="Upload partial_ok_datasets.csv"
@@ -1068,9 +1194,9 @@ def main():
                 st.warning("⏳ Please upload OK Datasets")
             
             if partial_file:
-                st.success("✅ Partial OK Datasets uploaded")
+                st.success("✅ OK but need attention Datasets uploaded")
             else:
-                st.warning("⏳ Please upload Partial OK Datasets")
+                st.warning("⏳ Please upload OK but need attention Datasets")
             
             if not_ok_file:
                 st.success("✅ Not OK Datasets uploaded")
@@ -1115,7 +1241,7 @@ def main():
                         border-radius: 20px; margin: 40px 0;">
                 <h2 style="color: #94a3b8;">👆 Upload Files to Get Started</h2>
                 <p style="color: #64748b; font-size: 1.1rem;">
-                    Please upload at least the OK, Partial OK, and Not OK CSV files<br>
+                    Please upload at least the OK, OK but need attention, and Not OK CSV files<br>
                     to view the validation dashboard.
                 </p>
             </div>
@@ -1164,10 +1290,29 @@ def main():
     
     # Calculate metrics
     ok_count = len(df_ok['Dataset ID'].unique()) if 'Dataset ID' in df_ok.columns else len(df_ok)
-    partial_count = len(df_partial['Dataset ID'].unique()) if 'Dataset ID' in df_partial.columns else len(df_partial)
-    not_ok_count = len(df_not_ok['Dataset ID'].unique()) if 'Dataset ID' in df_not_ok.columns else len(df_not_ok)
+    partial_count_raw = len(df_partial['Dataset ID'].unique()) if 'Dataset ID' in df_partial.columns else len(df_partial)
+    not_ok_count_raw = len(df_not_ok['Dataset ID'].unique()) if 'Dataset ID' in df_not_ok.columns else len(df_not_ok)
+    
+    # Count Case 6 from "OK but need attention" - these should be counted as Not OK for metrics
+    case6_count = 0
+    if not df_partial.empty:
+        reason_col = next((c for c in ['Sanity reason', 'sanity reason', 'sanity_reason', 'Sanity Reason'] if c in df_partial.columns), None)
+        if reason_col:
+            df_case6 = df_partial[df_partial[reason_col].astype(str).str.contains('Case 6', case=False, na=False)]
+            case6_count = df_case6['Dataset ID'].nunique() if 'Dataset ID' in df_case6.columns else len(df_case6)
+    
+    # Adjust counts: Move Case 6 from "OK but need attention" to "Not OK"
+    partial_count = partial_count_raw - case6_count
+    not_ok_count = not_ok_count_raw + case6_count
+    
     total_count = ok_count + partial_count + not_ok_count
-    success_rate = (ok_count / total_count * 100) if total_count > 0 else 0
+    # Success Rate = (OK + OK but need attention (excluding Case 6)) / Total
+    success_rate = ((ok_count + partial_count) / total_count * 100) if total_count > 0 else 0
+    
+    # Calculate percentages for each category
+    ok_percentage = (ok_count / total_count * 100) if total_count > 0 else 0
+    partial_percentage = (partial_count / total_count * 100) if total_count > 0 else 0
+    not_ok_percentage = (not_ok_count / total_count * 100) if total_count > 0 else 0
     
     # Get sanity run date
     sanity_date = get_sanity_run_date(df_ok) or get_sanity_run_date(df_not_ok)
@@ -1185,13 +1330,13 @@ def main():
     col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
-        st.markdown(create_metric_card("✅", "OK Datasets", ok_count, COLORS['ok']), unsafe_allow_html=True)
+        st.markdown(create_metric_card("✅", "OK Datasets", ok_count, COLORS['ok'], ok_percentage), unsafe_allow_html=True)
     
     with col2:
-        st.markdown(create_metric_card("⚠️", "Partial OK", partial_count, COLORS['partial_ok']), unsafe_allow_html=True)
+        st.markdown(create_metric_card("⚠️", "OK but need attention", partial_count, COLORS['partial_ok'], partial_percentage), unsafe_allow_html=True)
     
     with col3:
-        st.markdown(create_metric_card("❌", "Not OK", not_ok_count, COLORS['not_ok']), unsafe_allow_html=True)
+        st.markdown(create_metric_card("❌", "Not OK", not_ok_count, COLORS['not_ok'], not_ok_percentage), unsafe_allow_html=True)
     
     with col4:
         st.markdown(create_metric_card("📊", "Total Datasets", total_count, COLORS['primary']), unsafe_allow_html=True)
@@ -1202,7 +1347,7 @@ def main():
     st.markdown("<br><br>", unsafe_allow_html=True)
     
     # Tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "✅ OK Datasets", "⚠️ Partial OK", "❌ Not OK", "📈 Summary"])
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "✅ OK Datasets", "⚠️ OK but need attention", "❌ Not OK", "📈 Summary"])
     
     # ==========================================================================
     # OVERVIEW TAB
@@ -1222,7 +1367,7 @@ def main():
             # Combine all dataframes for case distribution
             all_cases_df = pd.concat([
                 df_ok.assign(Category='OK') if not df_ok.empty else pd.DataFrame(),
-                df_partial.assign(Category='Partial OK') if not df_partial.empty else pd.DataFrame(),
+                df_partial.assign(Category='OK but need attention') if not df_partial.empty else pd.DataFrame(),
                 df_not_ok.assign(Category='Not OK') if not df_not_ok.empty else pd.DataFrame()
             ], ignore_index=True)
             
@@ -1257,7 +1402,7 @@ def main():
         
         excel_data = convert_dfs_to_excel({
             'OK Datasets': df_ok,
-            'Partial OK': df_partial,
+            'OK but need attention': df_partial,
             'Not OK': df_not_ok,
             'Summary': df_summary
         })
@@ -1331,17 +1476,19 @@ def main():
     # PARTIAL OK DATASETS TAB
     # ==========================================================================
     with tab3:
-        st.markdown("### ⚠️ Partial OK Datasets")
+        st.markdown("### ⚠️ OK but need attention Datasets")
         st.markdown("---")
         
-        # Case-wise Distribution Section
-        case_result = get_case_distribution(df_partial, case_descriptions=PARTIAL_OK_CASE_DESCRIPTIONS)
+        # Case-wise Distribution Section with Next Steps
+        case_result = get_case_distribution(df_partial, case_descriptions=OK_BUT_NEED_ATTENTION_CASE_DESCRIPTIONS)
         if case_result:
             case_data, total = case_result
-            create_case_distribution_table(case_data, total, "Case-wise Distribution (Partial OK Datasets)")
+            # Add Next Steps column
+            case_data['Next Steps'] = case_data['Case'].map(OK_BUT_NEED_ATTENTION_NEXT_STEPS).fillna('')
+            create_case_distribution_table_with_next_steps(case_data, total, "Case-wise Distribution (OK but need attention Datasets)")
             st.markdown("---")
         
-        # Filters
+        # Filters - Row 1
         with st.expander("🔍 Filters", expanded=True):
             col1, col2, col3, col4 = st.columns(4)
             
@@ -1369,6 +1516,37 @@ def main():
                     reason_partial = st.multiselect("Sanity Reason", options=reasons, key="partial_reason")
                 else:
                     reason_partial = []
+            
+            # Filters - Row 2 (New filters)
+            col5, col6, col7, col8 = st.columns(4)
+            
+            with col5:
+                old_status_col = next((c for c in ['Old status', 'old_status', 'Old Status'] if c in df_partial.columns), None)
+                if old_status_col:
+                    old_status_partial = st.multiselect("Old Status", options=df_partial[old_status_col].dropna().unique(), key="partial_old_status")
+                else:
+                    old_status_partial = []
+            
+            with col6:
+                new_status_col = next((c for c in ['New status', 'new_status', 'New Status'] if c in df_partial.columns), None)
+                if new_status_col:
+                    new_status_partial = st.multiselect("New Status", options=df_partial[new_status_col].dropna().unique(), key="partial_new_status")
+                else:
+                    new_status_partial = []
+            
+            with col7:
+                old_source_col = next((c for c in ['old_source_type', 'Old Source Type', 'old source type'] if c in df_partial.columns), None)
+                if old_source_col:
+                    old_source_partial = st.multiselect("Old Source Type", options=df_partial[old_source_col].dropna().unique(), key="partial_old_source")
+                else:
+                    old_source_partial = []
+            
+            with col8:
+                new_source_col = next((c for c in ['new_source_type', 'New Source Type', 'new source type'] if c in df_partial.columns), None)
+                if new_source_col:
+                    new_source_partial = st.multiselect("New Source Type", options=df_partial[new_source_col].dropna().unique(), key="partial_new_source")
+                else:
+                    new_source_partial = []
         
         # Apply filters
         filtered_partial = df_partial.copy()
@@ -1380,6 +1558,21 @@ def main():
             filtered_partial = filtered_partial[filtered_partial[max_date_col].isin(max_date_partial)]
         if reason_partial and reason_col:
             filtered_partial = filtered_partial[filtered_partial[reason_col].isin(reason_partial)]
+        # New filters
+        if old_status_partial and old_status_col:
+            filtered_partial = filtered_partial[filtered_partial[old_status_col].isin(old_status_partial)]
+        if new_status_partial and new_status_col:
+            filtered_partial = filtered_partial[filtered_partial[new_status_col].isin(new_status_partial)]
+        if old_source_partial and old_source_col:
+            filtered_partial = filtered_partial[filtered_partial[old_source_col].isin(old_source_partial)]
+        if new_source_partial and new_source_col:
+            filtered_partial = filtered_partial[filtered_partial[new_source_col].isin(new_source_partial)]
+        
+        # Add Next Steps Suggested column based on case
+        if reason_col and reason_col in filtered_partial.columns:
+            filtered_partial['Next Steps Suggested'] = filtered_partial[reason_col].apply(
+                lambda x: OK_BUT_NEED_ATTENTION_NEXT_STEPS.get(extract_case_number(x), '') if pd.notna(x) else ''
+            )
         
         # Display count
         unique_datasets = filtered_partial['Dataset ID'].nunique() if 'Dataset ID' in filtered_partial.columns else len(filtered_partial)
@@ -1392,7 +1585,7 @@ def main():
         st.download_button(
             label="📥 Download Filtered Results (CSV)",
             data=convert_df_to_csv(filtered_partial),
-            file_name="partial_ok_datasets_filtered.csv",
+            file_name="ok_but_need_attention_datasets_filtered.csv",
             mime="text/csv"
         )
     
@@ -1410,7 +1603,7 @@ def main():
             create_case_distribution_table(case_data, total, "Case-wise Distribution (Not OK Datasets)")
             st.markdown("---")
         
-        # Filters
+        # Filters - Row 1
         with st.expander("🔍 Filters", expanded=True):
             col1, col2, col3, col4 = st.columns(4)
             
@@ -1438,6 +1631,37 @@ def main():
                     reason_notok = st.multiselect("Sanity Reason", options=reasons, key="notok_reason")
                 else:
                     reason_notok = []
+            
+            # Filters - Row 2 (New filters)
+            col5, col6, col7, col8 = st.columns(4)
+            
+            with col5:
+                old_status_col_notok = next((c for c in ['Old status', 'old_status', 'Old Status'] if c in df_not_ok.columns), None)
+                if old_status_col_notok:
+                    old_status_notok = st.multiselect("Old Status", options=df_not_ok[old_status_col_notok].dropna().unique(), key="notok_old_status")
+                else:
+                    old_status_notok = []
+            
+            with col6:
+                new_status_col_notok = next((c for c in ['New status', 'new_status', 'New Status'] if c in df_not_ok.columns), None)
+                if new_status_col_notok:
+                    new_status_notok = st.multiselect("New Status", options=df_not_ok[new_status_col_notok].dropna().unique(), key="notok_new_status")
+                else:
+                    new_status_notok = []
+            
+            with col7:
+                old_source_col_notok = next((c for c in ['old_source_type', 'Old Source Type', 'old source type'] if c in df_not_ok.columns), None)
+                if old_source_col_notok:
+                    old_source_notok = st.multiselect("Old Source Type", options=df_not_ok[old_source_col_notok].dropna().unique(), key="notok_old_source")
+                else:
+                    old_source_notok = []
+            
+            with col8:
+                new_source_col_notok = next((c for c in ['new_source_type', 'New Source Type', 'new source type'] if c in df_not_ok.columns), None)
+                if new_source_col_notok:
+                    new_source_notok = st.multiselect("New Source Type", options=df_not_ok[new_source_col_notok].dropna().unique(), key="notok_new_source")
+                else:
+                    new_source_notok = []
         
         # Apply filters
         filtered_notok = df_not_ok.copy()
@@ -1449,6 +1673,15 @@ def main():
             filtered_notok = filtered_notok[filtered_notok[status_col].isin(status_notok)]
         if reason_notok and reason_col:
             filtered_notok = filtered_notok[filtered_notok[reason_col].isin(reason_notok)]
+        # New filters
+        if old_status_notok and old_status_col_notok:
+            filtered_notok = filtered_notok[filtered_notok[old_status_col_notok].isin(old_status_notok)]
+        if new_status_notok and new_status_col_notok:
+            filtered_notok = filtered_notok[filtered_notok[new_status_col_notok].isin(new_status_notok)]
+        if old_source_notok and old_source_col_notok:
+            filtered_notok = filtered_notok[filtered_notok[old_source_col_notok].isin(old_source_notok)]
+        if new_source_notok and new_source_col_notok:
+            filtered_notok = filtered_notok[filtered_notok[new_source_col_notok].isin(new_source_notok)]
         
         # Display count
         unique_datasets = filtered_notok['Dataset ID'].nunique() if 'Dataset ID' in filtered_notok.columns else len(filtered_notok)
