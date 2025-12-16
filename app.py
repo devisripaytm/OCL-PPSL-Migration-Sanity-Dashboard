@@ -898,6 +898,376 @@ def create_source_type_case_breakdown(df, case_count, title):
 
 
 # =============================================================================
+# VARIANCE ANALYSIS FUNCTIONS
+# =============================================================================
+
+# Percentage Variance Buckets (using exact match check separately)
+PERCENTAGE_BUCKETS = [
+    ('0% (Exact Match)', 0, 0),        # Only for absolute 0
+    ('0-10%', 0, 10),                   # >0 and <=10
+    ('10-20%', 10, 20),                 # >10 and <=20
+    ('20-40%', 20, 40),                 # >20 and <=40
+    ('40-60%', 40, 60),                 # >40 and <=60
+    ('60-80%', 60, 80),                 # >60 and <=80
+    ('80-100%', 80, 100),               # >80 and <=100
+    ('>100%', 100, float('inf'))        # >100
+]
+
+# Absolute Difference Buckets
+ABSOLUTE_BUCKETS = [
+    ('0 (Exact Match)', 0, 0),
+    ('1-100', 1, 100),
+    ('101-500', 101, 500),
+    ('501-1000', 501, 1000),
+    ('1001-5000', 1001, 5000),
+    ('5001-10000', 5001, 10000),
+    ('>10000', 10001, float('inf'))
+]
+
+
+def calculate_variance_metrics(df_partial, df_not_ok):
+    """
+    Calculate variance metrics for OK but need attention and Not OK datasets.
+    Returns a DataFrame with variance calculations.
+    """
+    all_records = []
+    
+    # Only include OK but need attention and Not OK (these have count columns)
+    for df, category in [(df_partial, 'OK but need attention'), (df_not_ok, 'Not OK')]:
+        if df is None or df.empty:
+            continue
+        
+        # Find relevant columns
+        old_count_col = next((c for c in ['old count', 'old_count', 'Old Count'] if c in df.columns), None)
+        new_count_col = next((c for c in ['new count', 'new_count', 'New Count'] if c in df.columns), None)
+        date_col = next((c for c in ['date', 'Date', 'partition_date'] if c in df.columns), None)
+        ingest_col = next((c for c in ['Ingest type', 'Ingestion type', 'ingest_type'] if c in df.columns), None)
+        source_col = get_source_type_column(df)
+        
+        if old_count_col is None or new_count_col is None:
+            continue
+        
+        for _, row in df.iterrows():
+            dataset_id = row.get('Dataset ID', '')
+            old_count = pd.to_numeric(row.get(old_count_col, 0), errors='coerce') or 0
+            new_count = pd.to_numeric(row.get(new_count_col, 0), errors='coerce') or 0
+            
+            # Get partition date (or "FULL" for FULL type)
+            partition_date = row.get(date_col, '') if date_col else ''
+            ingest_type = row.get(ingest_col, '') if ingest_col else ''
+            source_type = row.get(source_col, '') if source_col else ''
+            
+            # Handle FULL type
+            if ingest_type == 'FULL' or (not partition_date or str(partition_date).strip() == ''):
+                partition_date = 'FULL'
+            
+            # Calculate metrics
+            absolute_diff = abs(old_count - new_count)
+            
+            # Calculate percentage variance (keep full precision for bucket assignment)
+            if old_count == 0 and new_count == 0:
+                pct_variance_raw = 0.0
+            elif old_count == 0:
+                pct_variance_raw = 100.0  # Flag as significant variance
+            else:
+                pct_variance_raw = abs((old_count - new_count) / old_count) * 100
+            
+            all_records.append({
+                'Dataset ID': dataset_id,
+                'Partition Date': partition_date,
+                'Old Count': int(old_count),
+                'New Count': int(new_count),
+                'Absolute Difference': int(absolute_diff),
+                'Percentage Variance': round(pct_variance_raw, 4),  # Display with 4 decimals
+                'Percentage Variance Raw': pct_variance_raw,  # Keep raw for bucket assignment
+                'Ingest Type': ingest_type,
+                'Source Type': source_type,
+                'Category': category
+            })
+    
+    if not all_records:
+        return pd.DataFrame()
+    
+    return pd.DataFrame(all_records)
+
+
+def get_percentage_bucket(pct_variance):
+    """Assign a percentage variance value to its bucket."""
+    # Use raw value, not rounded, for bucket assignment
+    # Exact match ONLY if variance is exactly 0 (or very close due to floating point)
+    if abs(pct_variance) < 0.0001:  # Essentially 0
+        return '0% (Exact Match)'
+    elif pct_variance <= 10:
+        return '0-10%'
+    elif pct_variance <= 20:
+        return '10-20%'
+    elif pct_variance <= 40:
+        return '20-40%'
+    elif pct_variance <= 60:
+        return '40-60%'
+    elif pct_variance <= 80:
+        return '60-80%'
+    elif pct_variance <= 100:
+        return '80-100%'
+    else:
+        return '>100%'
+
+
+def get_absolute_bucket(abs_diff):
+    """Assign an absolute difference value to its bucket."""
+    if abs_diff == 0:
+        return '0 (Exact Match)'
+    elif abs_diff <= 100:
+        return '1-100'
+    elif abs_diff <= 500:
+        return '101-500'
+    elif abs_diff <= 1000:
+        return '501-1000'
+    elif abs_diff <= 5000:
+        return '1001-5000'
+    elif abs_diff <= 10000:
+        return '5001-10000'
+    else:
+        return '>10000'
+
+
+def create_variance_distribution_table(variance_df, bucket_type='percentage', aggregate_by_dataset=False):
+    """
+    Create distribution table for variance analysis.
+    bucket_type: 'percentage' or 'absolute'
+    aggregate_by_dataset: If True, count unique datasets. If False, count all rows.
+    """
+    if variance_df is None or variance_df.empty:
+        return None
+    
+    df = variance_df.copy()
+    
+    if bucket_type == 'percentage':
+        # Use raw variance for bucket assignment (not rounded)
+        variance_col = 'Percentage Variance Raw' if 'Percentage Variance Raw' in df.columns else 'Percentage Variance'
+        buckets = ['0% (Exact Match)', '0-10%', '10-20%', '20-40%', '40-60%', '60-80%', '80-100%', '>100%']
+        bucket_col_name = 'Variance Bucket'
+        
+        if aggregate_by_dataset:
+            # For each dataset, use MAX variance
+            df_agg = df.groupby('Dataset ID')[variance_col].max().reset_index()
+            df_agg['Bucket'] = df_agg[variance_col].apply(get_percentage_bucket)
+            counts = df_agg.groupby('Bucket').size().reindex(buckets, fill_value=0)
+            total_count = len(df_agg)
+        else:
+            df['Bucket'] = df[variance_col].apply(get_percentage_bucket)
+            counts = df.groupby('Bucket').size().reindex(buckets, fill_value=0)
+            total_count = len(df)
+    else:
+        buckets = ['0 (Exact Match)', '1-100', '101-500', '501-1000', '1001-5000', '5001-10000', '>10000']
+        bucket_col_name = 'Difference Bucket'
+        
+        if aggregate_by_dataset:
+            # For each dataset, use MAX absolute difference
+            df_agg = df.groupby('Dataset ID')['Absolute Difference'].max().reset_index()
+            df_agg['Bucket'] = df_agg['Absolute Difference'].apply(get_absolute_bucket)
+            counts = df_agg.groupby('Bucket').size().reindex(buckets, fill_value=0)
+            total_count = len(df_agg)
+        else:
+            df['Bucket'] = df['Absolute Difference'].apply(get_absolute_bucket)
+            counts = df.groupby('Bucket').size().reindex(buckets, fill_value=0)
+            total_count = len(df)
+    
+    # Calculate percentages
+    pct_of_total = (counts / total_count * 100).round(1) if total_count > 0 else counts * 0
+    
+    # Create result DataFrame
+    count_col_name = 'Unique Datasets' if aggregate_by_dataset else 'Partition Date Rows'
+    
+    result = pd.DataFrame({
+        bucket_col_name: buckets,
+        count_col_name: counts.values,
+        '% of Total': [f"{p}%" for p in pct_of_total.values]
+    })
+    
+    # Add total row
+    total_row = pd.DataFrame([{
+        bucket_col_name: '**Total**',
+        count_col_name: total_count,
+        '% of Total': '100%'
+    }])
+    
+    result = pd.concat([result, total_row], ignore_index=True)
+    
+    return result
+
+
+def create_variance_bar_chart(variance_df, bucket_type='percentage', title_prefix='', aggregate_by_dataset=False):
+    """
+    Create bar chart for variance distribution.
+    
+    aggregate_by_dataset: If True, count unique datasets (using max variance per dataset).
+                          If False, count all partition date rows.
+    """
+    if variance_df is None or variance_df.empty:
+        return None
+    
+    df = variance_df.copy()
+    
+    if bucket_type == 'percentage':
+        # Use raw variance for bucket assignment
+        variance_col = 'Percentage Variance Raw' if 'Percentage Variance Raw' in df.columns else 'Percentage Variance'
+        buckets = ['0% (Exact Match)', '0-10%', '10-20%', '20-40%', '40-60%', '60-80%', '80-100%', '>100%']
+        title = f'{title_prefix}Percentage Variance Distribution'
+        x_title = 'Variance Bucket'
+        
+        if aggregate_by_dataset:
+            # For each dataset, use the MAX variance to determine its bucket
+            df_agg = df.groupby('Dataset ID')[variance_col].max().reset_index()
+            df_agg['Bucket'] = df_agg[variance_col].apply(get_percentage_bucket)
+            counts = df_agg.groupby('Bucket').size().reindex(buckets, fill_value=0).reset_index()
+            y_title = 'Count of Unique Datasets'
+        else:
+            df['Bucket'] = df[variance_col].apply(get_percentage_bucket)
+            counts = df.groupby('Bucket').size().reindex(buckets, fill_value=0).reset_index()
+            y_title = 'Count of Partition Date Rows'
+    else:
+        buckets = ['0 (Exact Match)', '1-100', '101-500', '501-1000', '1001-5000', '5001-10000', '>10000']
+        title = f'{title_prefix}Absolute Difference Distribution'
+        x_title = 'Difference Bucket'
+        
+        if aggregate_by_dataset:
+            # For each dataset, use the MAX absolute difference to determine its bucket
+            df_agg = df.groupby('Dataset ID')['Absolute Difference'].max().reset_index()
+            df_agg['Bucket'] = df_agg['Absolute Difference'].apply(get_absolute_bucket)
+            counts = df_agg.groupby('Bucket').size().reindex(buckets, fill_value=0).reset_index()
+            y_title = 'Count of Unique Datasets'
+        else:
+            df['Bucket'] = df['Absolute Difference'].apply(get_absolute_bucket)
+            counts = df.groupby('Bucket').size().reindex(buckets, fill_value=0).reset_index()
+            y_title = 'Count of Partition Date Rows'
+    
+    counts.columns = ['Bucket', 'Count']
+    
+    # Define colors (gradient from green to red)
+    colors = ['#10B981', '#34D399', '#FBBF24', '#F59E0B', '#EF4444', '#DC2626', '#B91C1C', '#7F1D1D']
+    
+    fig = px.bar(
+        counts,
+        x='Bucket',
+        y='Count',
+        text='Count',
+        color='Bucket',
+        color_discrete_sequence=colors[:len(buckets)]
+    )
+    
+    fig.update_traces(textposition='outside', textfont_size=12)
+    fig.update_layout(
+        title=dict(text=title, font=dict(size=18, color='white')),
+        paper_bgcolor='rgba(0,0,0,0)',
+        plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='white'),
+        xaxis=dict(title=x_title, gridcolor='rgba(255,255,255,0.1)', tickangle=-45),
+        yaxis=dict(title=y_title, gridcolor='rgba(255,255,255,0.1)'),
+        showlegend=False,
+        height=400
+    )
+    
+    return fig
+
+
+def get_drilldown_data(variance_df, bucket_type='percentage', selected_bucket=None, aggregate_by_dataset=False):
+    """
+    Get detailed data for a specific bucket.
+    
+    aggregate_by_dataset: If True, show one row per dataset (using max variance to determine bucket).
+                          If False, show all partition date rows.
+    """
+    if variance_df is None or variance_df.empty or selected_bucket is None:
+        return None
+    
+    df = variance_df.copy()
+    variance_col = 'Percentage Variance Raw' if 'Percentage Variance Raw' in df.columns else 'Percentage Variance'
+    
+    if aggregate_by_dataset:
+        # Aggregate by dataset - use max variance/difference to determine bucket
+        if bucket_type == 'percentage':
+            # Get max variance per dataset
+            df_agg = df.groupby('Dataset ID').agg({
+                variance_col: 'max',
+                'Percentage Variance': 'max',
+                'Absolute Difference': 'max',
+                'Old Count': 'sum',  # Total counts across all partitions
+                'New Count': 'sum',
+                'Ingest Type': 'first',
+                'Source Type': 'first',
+                'Category': 'first'
+            }).reset_index()
+            df_agg['Bucket'] = df_agg[variance_col].apply(get_percentage_bucket)
+        else:
+            # Get max absolute difference per dataset
+            df_agg = df.groupby('Dataset ID').agg({
+                'Absolute Difference': 'max',
+                variance_col: 'max',
+                'Percentage Variance': 'max',
+                'Old Count': 'sum',
+                'New Count': 'sum',
+                'Ingest Type': 'first',
+                'Source Type': 'first',
+                'Category': 'first'
+            }).reset_index()
+            df_agg['Bucket'] = df_agg['Absolute Difference'].apply(get_absolute_bucket)
+        
+        # Filter to selected bucket
+        filtered = df_agg[df_agg['Bucket'] == selected_bucket].copy()
+        
+        if filtered.empty:
+            return None
+        
+        # Rename columns for clarity
+        filtered = filtered.rename(columns={
+            'Old Count': 'Total Old Count',
+            'New Count': 'Total New Count',
+            'Absolute Difference': 'Max Abs Difference',
+            'Percentage Variance': 'Max % Variance'
+        })
+        
+        # Select columns for display
+        display_cols = ['Dataset ID', 'Total Old Count', 'Total New Count', 
+                        'Max Abs Difference', 'Max % Variance', 'Ingest Type', 'Source Type', 'Category']
+        display_cols = [c for c in display_cols if c in filtered.columns]
+        
+        result = filtered[display_cols].copy()
+        result = result.sort_values('Dataset ID')
+        
+        # Format percentage variance
+        if 'Max % Variance' in result.columns:
+            result['Max % Variance'] = result['Max % Variance'].apply(lambda x: f"{x:.4f}%")
+        
+    else:
+        # Show all partition date rows
+        if bucket_type == 'percentage':
+            df['Bucket'] = df[variance_col].apply(get_percentage_bucket)
+        else:
+            df['Bucket'] = df['Absolute Difference'].apply(get_absolute_bucket)
+        
+        # Filter to selected bucket
+        filtered = df[df['Bucket'] == selected_bucket].copy()
+        
+        if filtered.empty:
+            return None
+        
+        # Select and order columns for display
+        display_cols = ['Dataset ID', 'Partition Date', 'Old Count', 'New Count', 
+                        'Absolute Difference', 'Percentage Variance', 'Ingest Type', 'Source Type', 'Category']
+        display_cols = [c for c in display_cols if c in filtered.columns]
+        
+        result = filtered[display_cols].copy()
+        result = result.sort_values(['Dataset ID', 'Partition Date'])
+        
+        # Format percentage variance
+        if 'Percentage Variance' in result.columns:
+            result['Percentage Variance'] = result['Percentage Variance'].apply(lambda x: f"{x:.4f}%")
+    
+    return result
+
+
+# =============================================================================
 # CHART FUNCTIONS
 # =============================================================================
 
@@ -1558,7 +1928,7 @@ def main():
     st.markdown("<br><br>", unsafe_allow_html=True)
     
     # Tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "✅ OK Datasets", "⚠️ OK but need attention", "❌ Not OK", "📈 Summary"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📊 Overview", "✅ OK Datasets", "⚠️ OK but need attention", "❌ Not OK", "📈 Summary", "📉 Variance Analysis"])
     
     # ==========================================================================
     # OVERVIEW TAB
@@ -2188,6 +2558,233 @@ def main():
                 file_name="not_ok_summary_filtered.csv",
                 mime="text/csv"
             )
+    
+    # ==========================================================================
+    # TAB 6: VARIANCE ANALYSIS
+    # ==========================================================================
+    with tab6:
+        st.markdown("### 📉 Variance Analysis")
+        st.markdown("*Analyze the variance (difference) between old and new API counts across all datasets and partition dates.*")
+        
+        # Explanation box
+        st.info("""
+        **📌 How to interpret this analysis:**
+        - This analysis covers **"OK but need attention" + "Not OK"** datasets only (not OK datasets)
+        - **Total Combinations** = Number of Dataset ID + Partition Date combinations
+        - **Unique Datasets** = Number of distinct Dataset IDs with variance
+        - Each "Not FULL" dataset can have up to 15 partition dates, hence combinations > unique datasets
+        - **0% (Exact Match)** = Only records where old_count == new_count (absolutely zero difference)
+        - Records with even tiny differences (e.g., 0.0007%) are in the "0-10%" bucket, NOT in "Exact Match"
+        """)
+        st.markdown("---")
+        
+        # Calculate variance metrics (OK but need attention + Not OK datasets only)
+        variance_df = calculate_variance_metrics(df_partial, df_not_ok)
+        
+        if variance_df is not None and not variance_df.empty:
+            # Filters
+            st.markdown("#### 🔍 Filters")
+            filter_col1, filter_col2, filter_col3 = st.columns(3)
+            
+            with filter_col1:
+                category_options = ['All'] + sorted(variance_df['Category'].dropna().unique().tolist())
+                selected_category = st.selectbox(
+                    "Category",
+                    options=category_options,
+                    key="variance_category"
+                )
+            
+            with filter_col2:
+                ingest_type_filter = st.selectbox(
+                    "Ingest Type",
+                    options=['All', 'FULL Only', 'Not FULL Only'],
+                    key="variance_ingest_type_filter"
+                )
+            
+            with filter_col3:
+                source_type_options = ['All'] + sorted([s for s in variance_df['Source Type'].dropna().unique().tolist() if s])
+                selected_source = st.selectbox(
+                    "Source Type",
+                    options=source_type_options,
+                    key="variance_source_type"
+                )
+            
+            # Apply filters
+            filtered_variance = variance_df.copy()
+            
+            if selected_category != 'All':
+                filtered_variance = filtered_variance[filtered_variance['Category'] == selected_category]
+            
+            if selected_source != 'All':
+                filtered_variance = filtered_variance[filtered_variance['Source Type'] == selected_source]
+            
+            # Filter by Ingest Type (FULL vs Not FULL)
+            if ingest_type_filter == 'FULL Only':
+                filtered_variance = filtered_variance[filtered_variance['Ingest Type'] == 'FULL']
+            elif ingest_type_filter == 'Not FULL Only':
+                filtered_variance = filtered_variance[filtered_variance['Ingest Type'] != 'FULL']
+            
+            st.markdown("---")
+            
+            # Summary metrics
+            st.markdown("#### 📊 Variance Overview")
+            
+            metric_col1, metric_col2, metric_col3, metric_col4, metric_col5 = st.columns(5)
+            
+            total_combinations = len(filtered_variance)
+            unique_datasets = filtered_variance['Dataset ID'].nunique()
+            exact_matches = len(filtered_variance[filtered_variance['Percentage Variance'] == 0])
+            exact_match_pct = (exact_matches / total_combinations * 100) if total_combinations > 0 else 0
+            avg_variance = filtered_variance['Percentage Variance'].mean() if not filtered_variance.empty else 0
+            
+            with metric_col1:
+                st.metric("Total Combinations", f"{total_combinations:,}")
+            with metric_col2:
+                st.metric("Unique Datasets", f"{unique_datasets:,}")
+            with metric_col3:
+                st.metric("Exact Matches", f"{exact_matches:,}")
+            with metric_col4:
+                st.metric("Exact Match %", f"{exact_match_pct:.1f}%")
+            with metric_col5:
+                st.metric("Avg Variance", f"{avg_variance:.1f}%")
+            
+            st.markdown("---")
+            
+            # Distribution Charts
+            st.markdown("#### 📈 Distribution Charts")
+            
+            # Add view toggle
+            view_mode = st.radio(
+                "📊 **View Mode**",
+                options=['By Dataset (Unique)', 'By Partition Date (All Rows)'],
+                horizontal=True,
+                key="variance_view_mode",
+                help="""
+                **By Dataset (Unique)**: Each dataset counted once based on its maximum variance across all partition dates.
+                
+                **By Partition Date (All Rows)**: Each partition date row counted separately. A dataset with 15 partitions contributes 15 counts.
+                """
+            )
+            
+            chart_col1, chart_col2 = st.columns(2)
+            
+            aggregate_by_dataset = (view_mode == 'By Dataset (Unique)')
+            
+            with chart_col1:
+                fig_pct = create_variance_bar_chart(filtered_variance, bucket_type='percentage', aggregate_by_dataset=aggregate_by_dataset)
+                if fig_pct:
+                    st.plotly_chart(fig_pct, use_container_width=True)
+            
+            with chart_col2:
+                fig_abs = create_variance_bar_chart(filtered_variance, bucket_type='absolute', aggregate_by_dataset=aggregate_by_dataset)
+                if fig_abs:
+                    st.plotly_chart(fig_abs, use_container_width=True)
+            
+            st.markdown("---")
+            
+            # Distribution Tables
+            st.markdown("#### 📋 Distribution Tables")
+            st.caption(f"*Showing: {view_mode}*")
+            
+            table_col1, table_col2 = st.columns(2)
+            
+            with table_col1:
+                st.markdown("##### Percentage Variance Distribution")
+                pct_table = create_variance_distribution_table(filtered_variance, bucket_type='percentage', aggregate_by_dataset=aggregate_by_dataset)
+                if pct_table is not None:
+                    st.dataframe(pct_table, use_container_width=True, hide_index=True, height=350)
+            
+            with table_col2:
+                st.markdown("##### Absolute Difference Distribution")
+                abs_table = create_variance_distribution_table(filtered_variance, bucket_type='absolute', aggregate_by_dataset=aggregate_by_dataset)
+                if abs_table is not None:
+                    st.dataframe(abs_table, use_container_width=True, hide_index=True, height=350)
+            
+            st.markdown("---")
+            
+            # Drill-Down Section
+            st.markdown("#### 🔎 Drill-Down Analysis")
+            
+            drilldown_col1, drilldown_col2 = st.columns(2)
+            
+            with drilldown_col1:
+                bucket_type_choice = st.radio(
+                    "Select Bucket Type",
+                    options=['Percentage Variance', 'Absolute Difference'],
+                    horizontal=True,
+                    key="drilldown_bucket_type"
+                )
+            
+            with drilldown_col2:
+                if bucket_type_choice == 'Percentage Variance':
+                    bucket_options = [b[0] for b in PERCENTAGE_BUCKETS]
+                else:
+                    bucket_options = [b[0] for b in ABSOLUTE_BUCKETS]
+                
+                selected_bucket = st.selectbox(
+                    "Select Bucket to Drill Down",
+                    options=bucket_options,
+                    key="drilldown_bucket_select"
+                )
+            
+            # Get and display drill-down data (respects the view mode toggle)
+            drilldown_type = 'percentage' if bucket_type_choice == 'Percentage Variance' else 'absolute'
+            drilldown_data = get_drilldown_data(
+                filtered_variance, 
+                bucket_type=drilldown_type, 
+                selected_bucket=selected_bucket,
+                aggregate_by_dataset=aggregate_by_dataset
+            )
+            
+            record_type = "unique datasets" if aggregate_by_dataset else "partition date rows"
+            
+            if drilldown_data is not None and not drilldown_data.empty:
+                st.markdown(f"##### Datasets in **{selected_bucket}** Bucket ({len(drilldown_data):,} {record_type})")
+                
+                # Add dataset search for drill-down
+                search_drilldown = st.text_input("🔍 Search Dataset ID", key="drilldown_search")
+                
+                if search_drilldown:
+                    drilldown_data = drilldown_data[
+                        drilldown_data['Dataset ID'].astype(str).str.contains(search_drilldown, case=False, na=False)
+                    ]
+                
+                st.dataframe(drilldown_data, use_container_width=True, height=400)
+                
+                # Download drill-down data
+                st.download_button(
+                    label=f"📥 Download {selected_bucket} Data (CSV)",
+                    data=convert_df_to_csv(drilldown_data),
+                    file_name=f"variance_drilldown_{selected_bucket.replace(' ', '_').replace('%', 'pct')}.csv",
+                    mime="text/csv",
+                    key="download_drilldown"
+                )
+            else:
+                st.info(f"ℹ️ No data found in the **{selected_bucket}** bucket.")
+            
+            st.markdown("---")
+            
+            # Full Variance Report Download
+            st.markdown("#### 📥 Export Full Variance Report")
+            
+            # Prepare full report
+            full_report = filtered_variance.copy()
+            variance_col = 'Percentage Variance Raw' if 'Percentage Variance Raw' in full_report.columns else 'Percentage Variance'
+            full_report['Percentage Bucket'] = full_report[variance_col].apply(get_percentage_bucket)
+            full_report['Absolute Bucket'] = full_report['Absolute Difference'].apply(get_absolute_bucket)
+            # Drop the raw column for cleaner export
+            if 'Percentage Variance Raw' in full_report.columns:
+                full_report = full_report.drop(columns=['Percentage Variance Raw'])
+            
+            st.download_button(
+                label="📥 Download Full Variance Report (CSV)",
+                data=convert_df_to_csv(full_report),
+                file_name="variance_analysis_full_report.csv",
+                mime="text/csv",
+                key="download_full_variance"
+            )
+        else:
+            st.warning("⚠️ No variance data available. Please ensure 'OK but need attention' and/or 'Not OK' datasets are loaded with count columns.")
     
     # ==========================================================================
     # SANITY RUN HISTORY SECTION (Bottom)
