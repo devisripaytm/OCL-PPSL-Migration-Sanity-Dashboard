@@ -74,17 +74,37 @@ st.markdown("""
 # =============================================================================
 # GOOGLE SHEETS CONFIGURATION
 # =============================================================================
-# Replace with your Google Sheet ID (from the URL)
+# Sheet IDs for different dataset types
 # URL format: https://docs.google.com/spreadsheets/d/{SHEET_ID}/edit
-GOOGLE_SHEET_ID = "1qDLLxbEpiJUv5Q6QAsUSOfi4X0FUxRQptsexh22Y5cc"
 
-# Tab names in the Google Sheet (must match exactly)
-SHEET_TABS = {
-    "ok": "ok_datasets",
-    "partial_ok": "partial_ok_datasets",
-    "not_ok": "not_ok_datasets",
-    "summary": "not_ok_summary"
+INGEST_SHEET_ID = "1qDLLxbEpiJUv5Q6QAsUSOfi4X0FUxRQptsexh22Y5cc"
+OLAP_SHEET_ID = "1M1jsNBLtGh8tHMMYl76CamRluEKWJwp0agMlYXTxfDE"#: Update after OLAP validation is complete
+
+# Configuration for each dataset type
+SHEET_CONFIG = {
+    "Ingest": {
+        "sheet_id": INGEST_SHEET_ID,
+        "tabs": {
+            "ok": "ok_datasets",
+            "partial_ok": "partial_ok_datasets",
+            "not_ok": "not_ok_datasets",
+            "summary": "not_ok_summary"
+        }
+    },
+    "OLAP": {
+        "sheet_id": OLAP_SHEET_ID,
+        "tabs": {
+            "ok": "olap_ok",
+            "partial_ok": "olap_partial_ok",
+            "not_ok": "olap_not_ok",
+            "summary": "olap_not_ok_summary"
+        }
+    }
 }
+
+# Legacy support - default to Ingest
+GOOGLE_SHEET_ID = INGEST_SHEET_ID
+SHEET_TABS = SHEET_CONFIG["Ingest"]["tabs"]
 
 # Cache duration in seconds (300 = 5 minutes)
 CACHE_TTL = 300
@@ -399,31 +419,38 @@ def load_sheet_data_public(sheet_id: str, tab_name: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def load_all_sheets_data(sheet_id: str) -> tuple:
+def load_all_sheets_data(sheet_id: str, dataset_type: str = "Ingest") -> tuple:
     """
-    Load all 4 sheets from Google Sheets.
+    Load all 4 sheets from Google Sheets based on dataset type.
     Uses service account authentication if available, falls back to public URL.
+    
+    Args:
+        sheet_id: Google Sheet ID
+        dataset_type: "Ingest" or "OLAP"
     
     Returns:
         Tuple of (df_ok, df_partial, df_not_ok, df_summary)
     """
+    # Get tab names for the selected dataset type
+    tabs = SHEET_CONFIG.get(dataset_type, SHEET_CONFIG["Ingest"])["tabs"]
+    
     # Try authenticated access first
     client = get_gspread_client()
     
     if client:
-        st.sidebar.success("✅ Connected to Google Sheets API")
+        st.sidebar.success(f"✅ Connected to Google Sheets API ({dataset_type})")
         # Use authenticated access
-        df_ok = load_sheet_data_authenticated(client, sheet_id, SHEET_TABS["ok"])
-        df_partial = load_sheet_data_authenticated(client, sheet_id, SHEET_TABS["partial_ok"])
-        df_not_ok = load_sheet_data_authenticated(client, sheet_id, SHEET_TABS["not_ok"])
-        df_summary = load_sheet_data_authenticated(client, sheet_id, SHEET_TABS["summary"])
+        df_ok = load_sheet_data_authenticated(client, sheet_id, tabs["ok"])
+        df_partial = load_sheet_data_authenticated(client, sheet_id, tabs["partial_ok"])
+        df_not_ok = load_sheet_data_authenticated(client, sheet_id, tabs["not_ok"])
+        df_summary = load_sheet_data_authenticated(client, sheet_id, tabs["summary"])
     else:
         st.sidebar.warning("⚠️ Using public URL fallback (no auth)")
         # Fallback to public URL method
-        df_ok = load_sheet_data_public(sheet_id, SHEET_TABS["ok"])
-        df_partial = load_sheet_data_public(sheet_id, SHEET_TABS["partial_ok"])
-        df_not_ok = load_sheet_data_public(sheet_id, SHEET_TABS["not_ok"])
-        df_summary = load_sheet_data_public(sheet_id, SHEET_TABS["summary"])
+        df_ok = load_sheet_data_public(sheet_id, tabs["ok"])
+        df_partial = load_sheet_data_public(sheet_id, tabs["partial_ok"])
+        df_not_ok = load_sheet_data_public(sheet_id, tabs["not_ok"])
+        df_summary = load_sheet_data_public(sheet_id, tabs["summary"])
     
     return df_ok, df_partial, df_not_ok, df_summary
 
@@ -1800,8 +1827,34 @@ def main():
         st.markdown("### 📊 Data Source")
         st.markdown("---")
         
+        # Dataset Type selector (Ingest or OLAP)
+        selected_dataset_type = st.selectbox(
+            "📁 Dataset Type",
+            options=["Ingest", "OLAP"],
+            index=0,
+            key="sidebar_dataset_type",
+            help="Select Ingest or OLAP validation data"
+        )
+        
+        # Store in session state for use elsewhere
+        if "current_dataset_type" not in st.session_state:
+            st.session_state.current_dataset_type = selected_dataset_type
+        elif st.session_state.current_dataset_type != selected_dataset_type:
+            # Dataset type changed - clear cache and update
+            st.cache_data.clear()
+            st.session_state.current_dataset_type = selected_dataset_type
+        
+        st.markdown("---")
+        
+        # Get sheet configuration for selected type
+        sheet_config = SHEET_CONFIG.get(selected_dataset_type, SHEET_CONFIG["Ingest"])
+        current_sheet_id = sheet_config["sheet_id"]
+        
+        # Check if sheet is configured for selected type
+        sheet_is_configured = current_sheet_id and len(current_sheet_id) > 10
+        
         # Check if Google Sheets is configured
-        sheets_configured = check_sheets_configured()
+        sheets_configured = check_sheets_configured() and sheet_is_configured
         
         # Data source selector
         if sheets_configured:
@@ -1812,8 +1865,11 @@ def main():
                 help="Choose to load data automatically from Google Sheets or upload files manually"
             )
         else:
+            if not sheet_is_configured and selected_dataset_type == "OLAP":
+                st.warning("⚠️ OLAP Google Sheet not configured. Please run OLAP validation and update the sheet ID.")
             data_source = "📁 Upload CSV Files"
-            st.info("ℹ️ Google Sheets not configured. Using file upload mode.")
+            if not sheet_is_configured:
+                st.info(f"ℹ️ {selected_dataset_type} Google Sheet not configured. Using file upload mode.")
         
         st.markdown("---")
         
@@ -1826,7 +1882,7 @@ def main():
         
         if data_source == "📡 Google Sheets (Auto)":
             # Google Sheets mode
-            st.markdown("### 🔗 Google Sheets")
+            st.markdown(f"### 🔗 Google Sheets ({selected_dataset_type})")
             
             # Show refresh button
             col1, col2 = st.columns(2)
@@ -1840,8 +1896,8 @@ def main():
             st.markdown("---")
             
             # Load data with spinner
-            with st.spinner("Loading from Google Sheets..."):
-                df_ok, df_partial, df_not_ok, df_summary = load_all_sheets_data(GOOGLE_SHEET_ID)
+            with st.spinner(f"Loading {selected_dataset_type} data from Google Sheets..."):
+                df_ok, df_partial, df_not_ok, df_summary = load_all_sheets_data(current_sheet_id, selected_dataset_type)
             
             # Check loading status
             ok_loaded = df_ok is not None and not df_ok.empty
@@ -1978,13 +2034,19 @@ def main():
     
     filter_col1, filter_col2, filter_col3 = st.columns([1, 1, 2])
     
+    # Get the current dataset type from session state (set in sidebar)
+    current_dataset_type = st.session_state.get("current_dataset_type", "Ingest")
+    
     with filter_col1:
-        dataset_type = st.selectbox(
-            "📁 Dataset Type",
-            options=["Ingest", "OLAP"],
-            index=0,
-            help="Filter by dataset type"
-        )
+        # Display current dataset type (controlled by sidebar)
+        st.markdown(f"""
+        <div style="background: rgba(59, 130, 246, 0.15); padding: 10px 15px; border-radius: 8px; 
+                    margin-top: 5px; border: 1px solid rgba(59, 130, 246, 0.3);">
+            <span style="color: #94a3b8; font-size: 12px;">📁 Dataset Type</span><br>
+            <strong style="color: #3B82F6; font-size: 16px;">{current_dataset_type}</strong>
+            <span style="color: #6B7280; font-size: 10px; display: block;">Change in sidebar ➜</span>
+        </div>
+        """, unsafe_allow_html=True)
     
     with filter_col2:
         decision_type = st.selectbox(
@@ -2000,7 +2062,7 @@ def main():
         <div style="background: rgba(59, 130, 246, 0.1); padding: 12px 20px; border-radius: 10px; 
                     border-left: 4px solid #3B82F6; margin-top: 25px;">
             <span style="color: #94a3b8;">Current View:</span>
-            <strong style="color: #3B82F6;"> {dataset_type}</strong> datasets |
+            <strong style="color: #3B82F6;"> {current_dataset_type}</strong> datasets |
             <strong style="color: #8B5CF6;"> {decision_type}</strong>
         </div>
         """, unsafe_allow_html=True)
@@ -2858,21 +2920,15 @@ def main():
                     if not not_full_critical_df.empty:
                         variance_col = 'Percentage Variance Raw' if 'Percentage Variance Raw' in not_full_critical_df.columns else 'Percentage Variance'
                         
-                        # Group by Dataset ID + Flag to show each dataset once per flag type
-                        # This ensures the count matches: 15 (Critical) + 52 (Zero Old) + 77 (Zero New) = 144
-                        not_full_agg = not_full_critical_df.groupby(['Dataset ID', 'Flag']).agg({
-                            'Old Count': 'sum',
-                            'New Count': 'sum',
-                            'Absolute Difference': 'max',
-                            variance_col: 'max',
-                            'Percentage Variance': 'max',
-                            'Source Type': 'first',
-                            'Category': 'first'
-                        }).reset_index()
+                        # For each Dataset ID + Flag, find the row with max Absolute Difference
+                        # This shows the partition with the highest difference (which is the critical one)
+                        idx_max = not_full_critical_df.groupby(['Dataset ID', 'Flag'])['Absolute Difference'].idxmax()
+                        not_full_agg = not_full_critical_df.loc[idx_max].copy()
                         
+                        # Rename columns for clarity
                         not_full_agg = not_full_agg.rename(columns={
-                            'Old Count': 'Total Old Count',
-                            'New Count': 'Total New Count',
+                            'Old Count': 'Old Count (Max Diff Partition)',
+                            'New Count': 'New Count (Max Diff Partition)',
                             'Absolute Difference': 'Max Abs Difference',
                             'Percentage Variance': 'Max % Variance'
                         })
@@ -2880,7 +2936,7 @@ def main():
                         not_full_agg = not_full_agg.sort_values('Max Abs Difference', ascending=False)
                         not_full_agg['Max % Variance'] = not_full_agg['Max % Variance'].apply(lambda x: f"{x:.2f}%")
                         
-                        display_cols = ['Dataset ID', 'Flag', 'Total Old Count', 'Total New Count', 'Max Abs Difference', 'Max % Variance', 'Source Type', 'Category']
+                        display_cols = ['Dataset ID', 'Flag', 'Partition Date', 'Old Count (Max Diff Partition)', 'New Count (Max Diff Partition)', 'Max Abs Difference', 'Max % Variance', 'Source Type', 'Category']
                         display_cols = [c for c in display_cols if c in not_full_agg.columns]
                         
                         st.dataframe(not_full_agg[display_cols], use_container_width=True, height=350)
@@ -2907,28 +2963,21 @@ def main():
                     if not full_critical_df.empty:
                         variance_col = 'Percentage Variance Raw' if 'Percentage Variance Raw' in full_critical_df.columns else 'Percentage Variance'
                         
-                        # Group by Dataset ID + Flag to show each dataset once per flag type
-                        full_agg = full_critical_df.groupby(['Dataset ID', 'Flag']).agg({
-                            'Old Count': 'sum',
-                            'New Count': 'sum',
-                            'Absolute Difference': 'max',
-                            variance_col: 'max',
-                            'Percentage Variance': 'max',
-                            'Source Type': 'first',
-                            'Category': 'first'
-                        }).reset_index()
+                        # For FULL type, there's only one "partition" per dataset, so just group by Dataset ID + Flag
+                        idx_max = full_critical_df.groupby(['Dataset ID', 'Flag'])['Absolute Difference'].idxmax()
+                        full_agg = full_critical_df.loc[idx_max].copy()
                         
                         full_agg = full_agg.rename(columns={
-                            'Old Count': 'Total Old Count',
-                            'New Count': 'Total New Count',
-                            'Absolute Difference': 'Max Abs Difference',
-                            'Percentage Variance': 'Max % Variance'
+                            'Old Count': 'Old Count',
+                            'New Count': 'New Count',
+                            'Absolute Difference': 'Abs Difference',
+                            'Percentage Variance': '% Variance'
                         })
                         
-                        full_agg = full_agg.sort_values('Max Abs Difference', ascending=False)
-                        full_agg['Max % Variance'] = full_agg['Max % Variance'].apply(lambda x: f"{x:.2f}%")
+                        full_agg = full_agg.sort_values('Abs Difference', ascending=False)
+                        full_agg['% Variance'] = full_agg['% Variance'].apply(lambda x: f"{x:.2f}%")
                         
-                        display_cols = ['Dataset ID', 'Flag', 'Total Old Count', 'Total New Count', 'Max Abs Difference', 'Max % Variance', 'Source Type', 'Category']
+                        display_cols = ['Dataset ID', 'Flag', 'Old Count', 'New Count', 'Abs Difference', '% Variance', 'Source Type', 'Category']
                         display_cols = [c for c in display_cols if c in full_agg.columns]
                         
                         st.dataframe(full_agg[display_cols], use_container_width=True, height=350)
