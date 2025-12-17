@@ -30,6 +30,47 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# Custom CSS to fix tab hover styling issue
+st.markdown("""
+<style>
+    /* Fix tab hover and active state styling */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    
+    .stTabs [data-baseweb="tab"] {
+        background-color: transparent;
+        border-radius: 4px;
+        padding: 10px 20px;
+        color: #9CA3AF;
+    }
+    
+    .stTabs [data-baseweb="tab"]:hover {
+        background-color: rgba(255, 255, 255, 0.1);
+        color: #F9FAFB;
+    }
+    
+    .stTabs [aria-selected="true"] {
+        background-color: #3B82F6 !important;
+        color: #FFFFFF !important;
+    }
+    
+    .stTabs [aria-selected="true"]:hover {
+        background-color: #2563EB !important;
+        color: #FFFFFF !important;
+    }
+    
+    /* Fix tab highlight bar */
+    .stTabs [data-baseweb="tab-highlight"] {
+        background-color: transparent !important;
+    }
+    
+    .stTabs [data-baseweb="tab-border"] {
+        background-color: transparent !important;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 # =============================================================================
 # GOOGLE SHEETS CONFIGURATION
 # =============================================================================
@@ -913,22 +954,39 @@ PERCENTAGE_BUCKETS = [
     ('>100%', 100, float('inf'))        # >100
 ]
 
-# Absolute Difference Buckets
-ABSOLUTE_BUCKETS = [
+# Absolute Difference Buckets for NOT FULL Type (extended to billions)
+ABSOLUTE_BUCKETS_NOT_FULL = [
     ('0 (Exact Match)', 0, 0),
     ('1-100', 1, 100),
-    ('101-500', 101, 500),
-    ('501-1000', 501, 1000),
-    ('1001-5000', 1001, 5000),
-    ('5001-10000', 5001, 10000),
-    ('>10000', 10001, float('inf'))
+    ('101-1K', 101, 1000),
+    ('1K-10K', 1001, 10000),
+    ('10K-100K', 10001, 100000),
+    ('100K-1M', 100001, 1000000),
+    ('1M-10M', 1000001, 10000000),
+    ('10M-100M', 10000001, 100000000),
+    ('100M-1B', 100000001, 1000000000),
+    ('>1B', 1000000001, float('inf'))
 ]
+
+# Absolute Difference Buckets for FULL Type (smaller thresholds)
+ABSOLUTE_BUCKETS_FULL = [
+    ('0 (Exact Match)', 0, 0),
+    ('1-100', 1, 100),
+    ('101-1K', 101, 1000),
+    ('1K-10K', 1001, 10000),
+    ('10K-40K', 10001, 40000),
+    ('>40K (Critical)', 40001, float('inf'))
+]
+
+# Critical Thresholds
+CRITICAL_THRESHOLD_NOT_FULL = 1000000  # 1 million
+CRITICAL_THRESHOLD_FULL = 40000  # 40 thousand
 
 
 def calculate_variance_metrics(df_partial, df_not_ok):
     """
     Calculate variance metrics for OK but need attention and Not OK datasets.
-    Returns a DataFrame with variance calculations.
+    Returns a DataFrame with variance calculations and flags.
     """
     all_records = []
     
@@ -949,8 +1007,16 @@ def calculate_variance_metrics(df_partial, df_not_ok):
         
         for _, row in df.iterrows():
             dataset_id = row.get('Dataset ID', '')
-            old_count = pd.to_numeric(row.get(old_count_col, 0), errors='coerce') or 0
-            new_count = pd.to_numeric(row.get(new_count_col, 0), errors='coerce') or 0
+            
+            # Proper numeric conversion - handle None, NaN, empty strings
+            old_val = row.get(old_count_col, 0)
+            new_val = row.get(new_count_col, 0)
+            
+            # Convert to numeric, coerce errors to NaN, then fill with 0
+            old_count = pd.to_numeric(old_val, errors='coerce')
+            new_count = pd.to_numeric(new_val, errors='coerce')
+            old_count = 0 if pd.isna(old_count) else int(old_count)
+            new_count = 0 if pd.isna(new_count) else int(new_count)
             
             # Get partition date (or "FULL" for FULL type)
             partition_date = row.get(date_col, '') if date_col else ''
@@ -958,10 +1024,11 @@ def calculate_variance_metrics(df_partial, df_not_ok):
             source_type = row.get(source_col, '') if source_col else ''
             
             # Handle FULL type
-            if ingest_type == 'FULL' or (not partition_date or str(partition_date).strip() == ''):
+            is_full_type = (ingest_type == 'FULL')
+            if is_full_type or (not partition_date or str(partition_date).strip() == ''):
                 partition_date = 'FULL'
             
-            # Calculate metrics
+            # Calculate metrics - use absolute value for difference
             absolute_diff = abs(old_count - new_count)
             
             # Calculate percentage variance (keep full precision for bucket assignment)
@@ -972,17 +1039,38 @@ def calculate_variance_metrics(df_partial, df_not_ok):
             else:
                 pct_variance_raw = abs((old_count - new_count) / old_count) * 100
             
+            # Determine flags
+            flag = ''
+            is_zero_both = (old_count == 0 and new_count == 0)
+            is_zero_old = (old_count == 0 and new_count > 0)
+            is_zero_new = (old_count > 0 and new_count == 0)
+            
+            if is_zero_both:
+                flag = 'Zero Both (Excluded)'
+            elif is_zero_old:
+                flag = 'Zero Old Count'
+            elif is_zero_new:
+                flag = 'Zero New Count'
+            elif is_full_type and absolute_diff > CRITICAL_THRESHOLD_FULL:
+                flag = 'Very Critical'
+            elif not is_full_type and absolute_diff > CRITICAL_THRESHOLD_NOT_FULL:
+                flag = 'Very Critical'
+            
             all_records.append({
                 'Dataset ID': dataset_id,
                 'Partition Date': partition_date,
-                'Old Count': int(old_count),
-                'New Count': int(new_count),
-                'Absolute Difference': int(absolute_diff),
+                'Old Count': old_count,
+                'New Count': new_count,
+                'Absolute Difference': absolute_diff,
                 'Percentage Variance': round(pct_variance_raw, 4),  # Display with 4 decimals
                 'Percentage Variance Raw': pct_variance_raw,  # Keep raw for bucket assignment
                 'Ingest Type': ingest_type,
                 'Source Type': source_type,
-                'Category': category
+                'Category': category,
+                'Flag': flag,
+                'Is Zero Both': is_zero_both,
+                'Is Zero Old': is_zero_old,
+                'Is Zero New': is_zero_new
             })
     
     if not all_records:
@@ -1013,29 +1101,60 @@ def get_percentage_bucket(pct_variance):
         return '>100%'
 
 
-def get_absolute_bucket(abs_diff):
-    """Assign an absolute difference value to its bucket."""
+def get_absolute_bucket_not_full(abs_diff):
+    """Assign an absolute difference value to its bucket for NOT FULL type."""
     if abs_diff == 0:
         return '0 (Exact Match)'
     elif abs_diff <= 100:
         return '1-100'
-    elif abs_diff <= 500:
-        return '101-500'
     elif abs_diff <= 1000:
-        return '501-1000'
-    elif abs_diff <= 5000:
-        return '1001-5000'
+        return '101-1K'
     elif abs_diff <= 10000:
-        return '5001-10000'
+        return '1K-10K'
+    elif abs_diff <= 100000:
+        return '10K-100K'
+    elif abs_diff <= 1000000:
+        return '100K-1M'
+    elif abs_diff <= 10000000:
+        return '1M-10M'
+    elif abs_diff <= 100000000:
+        return '10M-100M'
+    elif abs_diff <= 1000000000:
+        return '100M-1B'
     else:
-        return '>10000'
+        return '>1B'
 
 
-def create_variance_distribution_table(variance_df, bucket_type='percentage', aggregate_by_dataset=False):
+def get_absolute_bucket_full(abs_diff):
+    """Assign an absolute difference value to its bucket for FULL type."""
+    if abs_diff == 0:
+        return '0 (Exact Match)'
+    elif abs_diff <= 100:
+        return '1-100'
+    elif abs_diff <= 1000:
+        return '101-1K'
+    elif abs_diff <= 10000:
+        return '1K-10K'
+    elif abs_diff <= 40000:
+        return '10K-40K'
+    else:
+        return '>40K (Critical)'
+
+
+def get_absolute_bucket(abs_diff, ingest_type='Not FULL'):
+    """Assign an absolute difference value to its bucket based on ingest type."""
+    if ingest_type == 'FULL':
+        return get_absolute_bucket_full(abs_diff)
+    else:
+        return get_absolute_bucket_not_full(abs_diff)
+
+
+def create_variance_distribution_table(variance_df, bucket_type='percentage', aggregate_by_dataset=False, ingest_type_filter='All'):
     """
     Create distribution table for variance analysis.
     bucket_type: 'percentage' or 'absolute'
     aggregate_by_dataset: If True, count unique datasets. If False, count all rows.
+    ingest_type_filter: 'All', 'FULL Only', or 'Not FULL Only' - affects bucket selection for absolute
     """
     if variance_df is None or variance_df.empty:
         return None
@@ -1059,17 +1178,27 @@ def create_variance_distribution_table(variance_df, bucket_type='percentage', ag
             counts = df.groupby('Bucket').size().reindex(buckets, fill_value=0)
             total_count = len(df)
     else:
-        buckets = ['0 (Exact Match)', '1-100', '101-500', '501-1000', '1001-5000', '5001-10000', '>10000']
         bucket_col_name = 'Difference Bucket'
+        
+        # Determine which buckets to use based on ingest type filter
+        if ingest_type_filter == 'FULL Only':
+            buckets = ['0 (Exact Match)', '1-100', '101-1K', '1K-10K', '10K-40K', '>40K (Critical)']
+            bucket_func = get_absolute_bucket_full
+        else:
+            buckets = ['0 (Exact Match)', '1-100', '101-1K', '1K-10K', '10K-100K', '100K-1M', '1M-10M', '10M-100M', '100M-1B', '>1B']
+            bucket_func = get_absolute_bucket_not_full
         
         if aggregate_by_dataset:
             # For each dataset, use MAX absolute difference
-            df_agg = df.groupby('Dataset ID')['Absolute Difference'].max().reset_index()
-            df_agg['Bucket'] = df_agg['Absolute Difference'].apply(get_absolute_bucket)
+            df_agg = df.groupby('Dataset ID').agg({
+                'Absolute Difference': 'max',
+                'Ingest Type': 'first'
+            }).reset_index()
+            df_agg['Bucket'] = df_agg['Absolute Difference'].apply(bucket_func)
             counts = df_agg.groupby('Bucket').size().reindex(buckets, fill_value=0)
             total_count = len(df_agg)
         else:
-            df['Bucket'] = df['Absolute Difference'].apply(get_absolute_bucket)
+            df['Bucket'] = df['Absolute Difference'].apply(bucket_func)
             counts = df.groupby('Bucket').size().reindex(buckets, fill_value=0)
             total_count = len(df)
     
@@ -1097,12 +1226,13 @@ def create_variance_distribution_table(variance_df, bucket_type='percentage', ag
     return result
 
 
-def create_variance_bar_chart(variance_df, bucket_type='percentage', title_prefix='', aggregate_by_dataset=False):
+def create_variance_bar_chart(variance_df, bucket_type='percentage', title_prefix='', aggregate_by_dataset=False, ingest_type_filter='All'):
     """
     Create bar chart for variance distribution.
     
     aggregate_by_dataset: If True, count unique datasets (using max variance per dataset).
                           If False, count all partition date rows.
+    ingest_type_filter: Affects bucket selection for absolute difference
     """
     if variance_df is None or variance_df.empty:
         return None
@@ -1117,7 +1247,6 @@ def create_variance_bar_chart(variance_df, bucket_type='percentage', title_prefi
         x_title = 'Variance Bucket'
         
         if aggregate_by_dataset:
-            # For each dataset, use the MAX variance to determine its bucket
             df_agg = df.groupby('Dataset ID')[variance_col].max().reset_index()
             df_agg['Bucket'] = df_agg[variance_col].apply(get_percentage_bucket)
             counts = df_agg.groupby('Bucket').size().reindex(buckets, fill_value=0).reset_index()
@@ -1127,25 +1256,31 @@ def create_variance_bar_chart(variance_df, bucket_type='percentage', title_prefi
             counts = df.groupby('Bucket').size().reindex(buckets, fill_value=0).reset_index()
             y_title = 'Count of Partition Date Rows'
     else:
-        buckets = ['0 (Exact Match)', '1-100', '101-500', '501-1000', '1001-5000', '5001-10000', '>10000']
+        # Determine which buckets to use based on ingest type filter
+        if ingest_type_filter == 'FULL Only':
+            buckets = ['0 (Exact Match)', '1-100', '101-1K', '1K-10K', '10K-40K', '>40K (Critical)']
+            bucket_func = get_absolute_bucket_full
+        else:
+            buckets = ['0 (Exact Match)', '1-100', '101-1K', '1K-10K', '10K-100K', '100K-1M', '1M-10M', '10M-100M', '100M-1B', '>1B']
+            bucket_func = get_absolute_bucket_not_full
+        
         title = f'{title_prefix}Absolute Difference Distribution'
         x_title = 'Difference Bucket'
         
         if aggregate_by_dataset:
-            # For each dataset, use the MAX absolute difference to determine its bucket
             df_agg = df.groupby('Dataset ID')['Absolute Difference'].max().reset_index()
-            df_agg['Bucket'] = df_agg['Absolute Difference'].apply(get_absolute_bucket)
+            df_agg['Bucket'] = df_agg['Absolute Difference'].apply(bucket_func)
             counts = df_agg.groupby('Bucket').size().reindex(buckets, fill_value=0).reset_index()
             y_title = 'Count of Unique Datasets'
         else:
-            df['Bucket'] = df['Absolute Difference'].apply(get_absolute_bucket)
+            df['Bucket'] = df['Absolute Difference'].apply(bucket_func)
             counts = df.groupby('Bucket').size().reindex(buckets, fill_value=0).reset_index()
             y_title = 'Count of Partition Date Rows'
     
     counts.columns = ['Bucket', 'Count']
     
-    # Define colors (gradient from green to red)
-    colors = ['#10B981', '#34D399', '#FBBF24', '#F59E0B', '#EF4444', '#DC2626', '#B91C1C', '#7F1D1D']
+    # Define colors (gradient from green to red) - extend for more buckets
+    colors = ['#10B981', '#34D399', '#86EFAC', '#FBBF24', '#F59E0B', '#FB923C', '#EF4444', '#DC2626', '#B91C1C', '#7F1D1D']
     
     fig = px.bar(
         counts,
@@ -1171,12 +1306,13 @@ def create_variance_bar_chart(variance_df, bucket_type='percentage', title_prefi
     return fig
 
 
-def get_drilldown_data(variance_df, bucket_type='percentage', selected_bucket=None, aggregate_by_dataset=False):
+def get_drilldown_data(variance_df, bucket_type='percentage', selected_bucket=None, aggregate_by_dataset=False, ingest_type_filter='All'):
     """
     Get detailed data for a specific bucket.
     
     aggregate_by_dataset: If True, show one row per dataset (using max variance to determine bucket).
                           If False, show all partition date rows.
+    ingest_type_filter: Affects bucket function selection for absolute difference
     """
     if variance_df is None or variance_df.empty or selected_bucket is None:
         return None
@@ -1184,34 +1320,36 @@ def get_drilldown_data(variance_df, bucket_type='percentage', selected_bucket=No
     df = variance_df.copy()
     variance_col = 'Percentage Variance Raw' if 'Percentage Variance Raw' in df.columns else 'Percentage Variance'
     
+    # Determine bucket function for absolute difference
+    if ingest_type_filter == 'FULL Only':
+        abs_bucket_func = get_absolute_bucket_full
+    else:
+        abs_bucket_func = get_absolute_bucket_not_full
+    
     if aggregate_by_dataset:
         # Aggregate by dataset - use max variance/difference to determine bucket
+        agg_dict = {
+            variance_col: 'max',
+            'Percentage Variance': 'max',
+            'Absolute Difference': 'max',
+            'Old Count': 'sum',
+            'New Count': 'sum',
+            'Ingest Type': 'first',
+            'Source Type': 'first',
+            'Category': 'first'
+        }
+        if 'Flag' in df.columns:
+            # Get the most critical flag
+            agg_dict['Flag'] = lambda x: next((f for f in x if f == 'Very Critical'), 
+                                               next((f for f in x if 'Zero' in str(f)), 
+                                                    x.iloc[0] if len(x) > 0 else ''))
+        
+        df_agg = df.groupby('Dataset ID').agg(agg_dict).reset_index()
+        
         if bucket_type == 'percentage':
-            # Get max variance per dataset
-            df_agg = df.groupby('Dataset ID').agg({
-                variance_col: 'max',
-                'Percentage Variance': 'max',
-                'Absolute Difference': 'max',
-                'Old Count': 'sum',  # Total counts across all partitions
-                'New Count': 'sum',
-                'Ingest Type': 'first',
-                'Source Type': 'first',
-                'Category': 'first'
-            }).reset_index()
             df_agg['Bucket'] = df_agg[variance_col].apply(get_percentage_bucket)
         else:
-            # Get max absolute difference per dataset
-            df_agg = df.groupby('Dataset ID').agg({
-                'Absolute Difference': 'max',
-                variance_col: 'max',
-                'Percentage Variance': 'max',
-                'Old Count': 'sum',
-                'New Count': 'sum',
-                'Ingest Type': 'first',
-                'Source Type': 'first',
-                'Category': 'first'
-            }).reset_index()
-            df_agg['Bucket'] = df_agg['Absolute Difference'].apply(get_absolute_bucket)
+            df_agg['Bucket'] = df_agg['Absolute Difference'].apply(abs_bucket_func)
         
         # Filter to selected bucket
         filtered = df_agg[df_agg['Bucket'] == selected_bucket].copy()
@@ -1229,11 +1367,11 @@ def get_drilldown_data(variance_df, bucket_type='percentage', selected_bucket=No
         
         # Select columns for display
         display_cols = ['Dataset ID', 'Total Old Count', 'Total New Count', 
-                        'Max Abs Difference', 'Max % Variance', 'Ingest Type', 'Source Type', 'Category']
+                        'Max Abs Difference', 'Max % Variance', 'Ingest Type', 'Source Type', 'Category', 'Flag']
         display_cols = [c for c in display_cols if c in filtered.columns]
         
         result = filtered[display_cols].copy()
-        result = result.sort_values('Dataset ID')
+        result = result.sort_values('Max Abs Difference', ascending=False)
         
         # Format percentage variance
         if 'Max % Variance' in result.columns:
@@ -1244,7 +1382,7 @@ def get_drilldown_data(variance_df, bucket_type='percentage', selected_bucket=No
         if bucket_type == 'percentage':
             df['Bucket'] = df[variance_col].apply(get_percentage_bucket)
         else:
-            df['Bucket'] = df['Absolute Difference'].apply(get_absolute_bucket)
+            df['Bucket'] = df['Absolute Difference'].apply(abs_bucket_func)
         
         # Filter to selected bucket
         filtered = df[df['Bucket'] == selected_bucket].copy()
@@ -1254,11 +1392,11 @@ def get_drilldown_data(variance_df, bucket_type='percentage', selected_bucket=No
         
         # Select and order columns for display
         display_cols = ['Dataset ID', 'Partition Date', 'Old Count', 'New Count', 
-                        'Absolute Difference', 'Percentage Variance', 'Ingest Type', 'Source Type', 'Category']
+                        'Absolute Difference', 'Percentage Variance', 'Ingest Type', 'Source Type', 'Category', 'Flag']
         display_cols = [c for c in display_cols if c in filtered.columns]
         
         result = filtered[display_cols].copy()
-        result = result.sort_values(['Dataset ID', 'Partition Date'])
+        result = result.sort_values(['Absolute Difference'], ascending=False)
         
         # Format percentage variance
         if 'Percentage Variance' in result.columns:
@@ -2569,12 +2707,10 @@ def main():
         # Explanation box
         st.info("""
         **📌 How to interpret this analysis:**
-        - This analysis covers **"OK but need attention" + "Not OK"** datasets only (not OK datasets)
-        - **Total Combinations** = Number of Dataset ID + Partition Date combinations
-        - **Unique Datasets** = Number of distinct Dataset IDs with variance
-        - Each "Not FULL" dataset can have up to 15 partition dates, hence combinations > unique datasets
-        - **0% (Exact Match)** = Only records where old_count == new_count (absolutely zero difference)
-        - Records with even tiny differences (e.g., 0.0007%) are in the "0-10%" bucket, NOT in "Exact Match"
+        - This analysis covers **"OK but need attention" + "Not OK"** datasets only
+        - **Zero count cases** (old=0 AND new=0) are **excluded** from analysis and shown separately
+        - **Critical flags**: Not FULL (>1M diff) | FULL (>40K diff) | Zero Old | Zero New
+        - Extended buckets for Not FULL: up to >1 Billion | FULL: up to >40K (Critical)
         """)
         st.markdown("---")
         
@@ -2609,36 +2745,220 @@ def main():
                     key="variance_source_type"
                 )
             
-            # Apply filters
-            filtered_variance = variance_df.copy()
+            # Apply filters (before excluding zero counts)
+            filtered_all = variance_df.copy()
             
             if selected_category != 'All':
-                filtered_variance = filtered_variance[filtered_variance['Category'] == selected_category]
+                filtered_all = filtered_all[filtered_all['Category'] == selected_category]
             
             if selected_source != 'All':
-                filtered_variance = filtered_variance[filtered_variance['Source Type'] == selected_source]
+                filtered_all = filtered_all[filtered_all['Source Type'] == selected_source]
             
             # Filter by Ingest Type (FULL vs Not FULL)
             if ingest_type_filter == 'FULL Only':
-                filtered_variance = filtered_variance[filtered_variance['Ingest Type'] == 'FULL']
+                filtered_all = filtered_all[filtered_all['Ingest Type'] == 'FULL']
             elif ingest_type_filter == 'Not FULL Only':
-                filtered_variance = filtered_variance[filtered_variance['Ingest Type'] != 'FULL']
+                filtered_all = filtered_all[filtered_all['Ingest Type'] != 'FULL']
             
             st.markdown("---")
             
-            # Summary metrics
-            st.markdown("#### 📊 Variance Overview")
+            # ============== EXCLUDED DATASETS SECTION ==============
+            st.markdown("#### ⚠️ Excluded from Analysis (Zero Counts)")
+            
+            # Separate zero count cases
+            zero_both_df = filtered_all[filtered_all['Is Zero Both'] == True].copy()
+            zero_both_count = zero_both_df['Dataset ID'].nunique()
+            
+            # Split by ingest type
+            zero_both_full = zero_both_df[zero_both_df['Ingest Type'] == 'FULL']['Dataset ID'].nunique()
+            zero_both_not_full = zero_both_df[zero_both_df['Ingest Type'] != 'FULL']['Dataset ID'].nunique()
+            
+            excl_col1, excl_col2 = st.columns(2)
+            
+            with excl_col1:
+                st.markdown(f"""
+                <div style="background: linear-gradient(135deg, #374151 0%, #1F2937 100%); padding: 15px; border-radius: 10px; border-left: 4px solid #6B7280;">
+                    <h4 style="color: #9CA3AF; margin: 0;">🔘 Zero Count - FULL Type</h4>
+                    <h2 style="color: #F9FAFB; margin: 5px 0;">{zero_both_full:,} datasets</h2>
+                    <p style="color: #9CA3AF; margin: 0; font-size: 12px;">Both old and new counts are 0</p>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            with excl_col2:
+                st.markdown(f"""
+                <div style="background: linear-gradient(135deg, #374151 0%, #1F2937 100%); padding: 15px; border-radius: 10px; border-left: 4px solid #6B7280;">
+                    <h4 style="color: #9CA3AF; margin: 0;">🔘 Zero Count - Not FULL Type</h4>
+                    <h2 style="color: #F9FAFB; margin: 5px 0;">{zero_both_not_full:,} datasets</h2>
+                    <p style="color: #9CA3AF; margin: 0; font-size: 12px;">Both old and new counts are 0</p>
+                </div>
+                """, unsafe_allow_html=True)
+            
+            # Expander to view excluded datasets
+            with st.expander(f"📋 View {zero_both_count:,} Excluded Zero Count Datasets"):
+                if not zero_both_df.empty:
+                    display_cols = ['Dataset ID', 'Partition Date', 'Old Count', 'New Count', 'Ingest Type', 'Source Type', 'Category']
+                    display_cols = [c for c in display_cols if c in zero_both_df.columns]
+                    st.dataframe(zero_both_df[display_cols].drop_duplicates(), use_container_width=True, height=300)
+            
+            st.markdown("---")
+            
+            # ============== FILTER OUT ZERO COUNTS FOR MAIN ANALYSIS ==============
+            filtered_variance = filtered_all[filtered_all['Is Zero Both'] == False].copy()
+            
+            # ============== CRITICAL DATASETS SECTION ==============
+            st.markdown("#### 🚨 Critical Datasets")
+            
+            # Count critical cases
+            very_critical = filtered_variance[filtered_variance['Flag'] == 'Very Critical']['Dataset ID'].nunique()
+            zero_old = filtered_variance[filtered_variance['Flag'] == 'Zero Old Count']['Dataset ID'].nunique()
+            zero_new = filtered_variance[filtered_variance['Flag'] == 'Zero New Count']['Dataset ID'].nunique()
+            
+            # Split by ingest type
+            if ingest_type_filter != 'FULL Only':
+                not_full_critical = filtered_variance[(filtered_variance['Ingest Type'] != 'FULL') & (filtered_variance['Flag'] == 'Very Critical')]['Dataset ID'].nunique()
+                not_full_zero_old = filtered_variance[(filtered_variance['Ingest Type'] != 'FULL') & (filtered_variance['Flag'] == 'Zero Old Count')]['Dataset ID'].nunique()
+                not_full_zero_new = filtered_variance[(filtered_variance['Ingest Type'] != 'FULL') & (filtered_variance['Flag'] == 'Zero New Count')]['Dataset ID'].nunique()
+            else:
+                not_full_critical = not_full_zero_old = not_full_zero_new = 0
+            
+            if ingest_type_filter != 'Not FULL Only':
+                full_critical = filtered_variance[(filtered_variance['Ingest Type'] == 'FULL') & (filtered_variance['Flag'] == 'Very Critical')]['Dataset ID'].nunique()
+                full_zero_old = filtered_variance[(filtered_variance['Ingest Type'] == 'FULL') & (filtered_variance['Flag'] == 'Zero Old Count')]['Dataset ID'].nunique()
+                full_zero_new = filtered_variance[(filtered_variance['Ingest Type'] == 'FULL') & (filtered_variance['Flag'] == 'Zero New Count')]['Dataset ID'].nunique()
+            else:
+                full_critical = full_zero_old = full_zero_new = 0
+            
+            crit_col1, crit_col2 = st.columns(2)
+            
+            # Get critical datasets by type
+            not_full_critical_df = filtered_all[
+                (filtered_all['Ingest Type'] != 'FULL') & 
+                (filtered_all['Flag'].isin(['Very Critical', 'Zero Old Count', 'Zero New Count']))
+            ]
+            full_critical_df = filtered_all[
+                (filtered_all['Ingest Type'] == 'FULL') & 
+                (filtered_all['Flag'].isin(['Very Critical', 'Zero Old Count', 'Zero New Count']))
+            ]
+            
+            # Count by summing individual flag counts (to match card totals)
+            not_full_total = not_full_critical + not_full_zero_old + not_full_zero_new
+            full_total = full_critical + full_zero_old + full_zero_new
+            
+            with crit_col1:
+                st.markdown(f"""
+                <div style="background: linear-gradient(135deg, #7F1D1D 0%, #450A0A 100%); padding: 15px; border-radius: 10px; border-left: 4px solid #EF4444;">
+                    <h4 style="color: #FCA5A5; margin: 0;">🔴 Not FULL Type - Critical (>1M diff)</h4>
+                    <h2 style="color: #F9FAFB; margin: 5px 0;">{not_full_critical:,} datasets</h2>
+                    <p style="color: #FCA5A5; margin: 0; font-size: 12px;">Zero Old: {not_full_zero_old} | Zero New: {not_full_zero_new}</p>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Expander for Not FULL critical datasets
+                with st.expander(f"📋 View {not_full_total:,} Not FULL Critical Datasets"):
+                    if not not_full_critical_df.empty:
+                        variance_col = 'Percentage Variance Raw' if 'Percentage Variance Raw' in not_full_critical_df.columns else 'Percentage Variance'
+                        
+                        # Group by Dataset ID + Flag to show each dataset once per flag type
+                        # This ensures the count matches: 15 (Critical) + 52 (Zero Old) + 77 (Zero New) = 144
+                        not_full_agg = not_full_critical_df.groupby(['Dataset ID', 'Flag']).agg({
+                            'Old Count': 'sum',
+                            'New Count': 'sum',
+                            'Absolute Difference': 'max',
+                            variance_col: 'max',
+                            'Percentage Variance': 'max',
+                            'Source Type': 'first',
+                            'Category': 'first'
+                        }).reset_index()
+                        
+                        not_full_agg = not_full_agg.rename(columns={
+                            'Old Count': 'Total Old Count',
+                            'New Count': 'Total New Count',
+                            'Absolute Difference': 'Max Abs Difference',
+                            'Percentage Variance': 'Max % Variance'
+                        })
+                        
+                        not_full_agg = not_full_agg.sort_values('Max Abs Difference', ascending=False)
+                        not_full_agg['Max % Variance'] = not_full_agg['Max % Variance'].apply(lambda x: f"{x:.2f}%")
+                        
+                        display_cols = ['Dataset ID', 'Flag', 'Total Old Count', 'Total New Count', 'Max Abs Difference', 'Max % Variance', 'Source Type', 'Category']
+                        display_cols = [c for c in display_cols if c in not_full_agg.columns]
+                        
+                        st.dataframe(not_full_agg[display_cols], use_container_width=True, height=350)
+                        
+                        st.download_button(
+                            label="📥 Download Not FULL Critical (CSV)",
+                            data=convert_df_to_csv(not_full_agg[display_cols]),
+                            file_name="not_full_critical_datasets.csv",
+                            mime="text/csv",
+                            key="download_not_full_critical"
+                        )
+            
+            with crit_col2:
+                st.markdown(f"""
+                <div style="background: linear-gradient(135deg, #7F1D1D 0%, #450A0A 100%); padding: 15px; border-radius: 10px; border-left: 4px solid #F59E0B;">
+                    <h4 style="color: #FCD34D; margin: 0;">🟠 FULL Type - Critical (>40K diff)</h4>
+                    <h2 style="color: #F9FAFB; margin: 5px 0;">{full_critical:,} datasets</h2>
+                    <p style="color: #FCD34D; margin: 0; font-size: 12px;">Zero Old: {full_zero_old} | Zero New: {full_zero_new}</p>
+                </div>
+                """, unsafe_allow_html=True)
+                
+                # Expander for FULL critical datasets
+                with st.expander(f"📋 View {full_total:,} FULL Critical Datasets"):
+                    if not full_critical_df.empty:
+                        variance_col = 'Percentage Variance Raw' if 'Percentage Variance Raw' in full_critical_df.columns else 'Percentage Variance'
+                        
+                        # Group by Dataset ID + Flag to show each dataset once per flag type
+                        full_agg = full_critical_df.groupby(['Dataset ID', 'Flag']).agg({
+                            'Old Count': 'sum',
+                            'New Count': 'sum',
+                            'Absolute Difference': 'max',
+                            variance_col: 'max',
+                            'Percentage Variance': 'max',
+                            'Source Type': 'first',
+                            'Category': 'first'
+                        }).reset_index()
+                        
+                        full_agg = full_agg.rename(columns={
+                            'Old Count': 'Total Old Count',
+                            'New Count': 'Total New Count',
+                            'Absolute Difference': 'Max Abs Difference',
+                            'Percentage Variance': 'Max % Variance'
+                        })
+                        
+                        full_agg = full_agg.sort_values('Max Abs Difference', ascending=False)
+                        full_agg['Max % Variance'] = full_agg['Max % Variance'].apply(lambda x: f"{x:.2f}%")
+                        
+                        display_cols = ['Dataset ID', 'Flag', 'Total Old Count', 'Total New Count', 'Max Abs Difference', 'Max % Variance', 'Source Type', 'Category']
+                        display_cols = [c for c in display_cols if c in full_agg.columns]
+                        
+                        st.dataframe(full_agg[display_cols], use_container_width=True, height=350)
+                        
+                        st.download_button(
+                            label="📥 Download FULL Critical (CSV)",
+                            data=convert_df_to_csv(full_agg[display_cols]),
+                            file_name="full_critical_datasets.csv",
+                            mime="text/csv",
+                            key="download_full_critical"
+                        )
+                    else:
+                        st.info("ℹ️ No FULL type critical datasets found.")
+            
+            st.markdown("---")
+            
+            # ============== MAIN ANALYSIS (EXCLUDING ZERO COUNTS) ==============
+            st.markdown("#### 📊 Variance Overview (Excluding Zero Count Cases)")
             
             metric_col1, metric_col2, metric_col3, metric_col4, metric_col5 = st.columns(5)
             
             total_combinations = len(filtered_variance)
             unique_datasets = filtered_variance['Dataset ID'].nunique()
-            exact_matches = len(filtered_variance[filtered_variance['Percentage Variance'] == 0])
+            variance_col = 'Percentage Variance Raw' if 'Percentage Variance Raw' in filtered_variance.columns else 'Percentage Variance'
+            exact_matches = len(filtered_variance[filtered_variance[variance_col] < 0.0001])
             exact_match_pct = (exact_matches / total_combinations * 100) if total_combinations > 0 else 0
             avg_variance = filtered_variance['Percentage Variance'].mean() if not filtered_variance.empty else 0
             
             with metric_col1:
-                st.metric("Total Combinations", f"{total_combinations:,}")
+                st.metric("Total Rows", f"{total_combinations:,}")
             with metric_col2:
                 st.metric("Unique Datasets", f"{unique_datasets:,}")
             with metric_col3:
@@ -2671,12 +2991,12 @@ def main():
             aggregate_by_dataset = (view_mode == 'By Dataset (Unique)')
             
             with chart_col1:
-                fig_pct = create_variance_bar_chart(filtered_variance, bucket_type='percentage', aggregate_by_dataset=aggregate_by_dataset)
+                fig_pct = create_variance_bar_chart(filtered_variance, bucket_type='percentage', aggregate_by_dataset=aggregate_by_dataset, ingest_type_filter=ingest_type_filter)
                 if fig_pct:
                     st.plotly_chart(fig_pct, use_container_width=True)
             
             with chart_col2:
-                fig_abs = create_variance_bar_chart(filtered_variance, bucket_type='absolute', aggregate_by_dataset=aggregate_by_dataset)
+                fig_abs = create_variance_bar_chart(filtered_variance, bucket_type='absolute', aggregate_by_dataset=aggregate_by_dataset, ingest_type_filter=ingest_type_filter)
                 if fig_abs:
                     st.plotly_chart(fig_abs, use_container_width=True)
             
@@ -2684,21 +3004,21 @@ def main():
             
             # Distribution Tables
             st.markdown("#### 📋 Distribution Tables")
-            st.caption(f"*Showing: {view_mode}*")
+            st.caption(f"*Showing: {view_mode} | Ingest Type: {ingest_type_filter}*")
             
             table_col1, table_col2 = st.columns(2)
             
             with table_col1:
                 st.markdown("##### Percentage Variance Distribution")
-                pct_table = create_variance_distribution_table(filtered_variance, bucket_type='percentage', aggregate_by_dataset=aggregate_by_dataset)
+                pct_table = create_variance_distribution_table(filtered_variance, bucket_type='percentage', aggregate_by_dataset=aggregate_by_dataset, ingest_type_filter=ingest_type_filter)
                 if pct_table is not None:
-                    st.dataframe(pct_table, use_container_width=True, hide_index=True, height=350)
+                    st.dataframe(pct_table, use_container_width=True, hide_index=True, height=400)
             
             with table_col2:
                 st.markdown("##### Absolute Difference Distribution")
-                abs_table = create_variance_distribution_table(filtered_variance, bucket_type='absolute', aggregate_by_dataset=aggregate_by_dataset)
+                abs_table = create_variance_distribution_table(filtered_variance, bucket_type='absolute', aggregate_by_dataset=aggregate_by_dataset, ingest_type_filter=ingest_type_filter)
                 if abs_table is not None:
-                    st.dataframe(abs_table, use_container_width=True, hide_index=True, height=350)
+                    st.dataframe(abs_table, use_container_width=True, hide_index=True, height=400)
             
             st.markdown("---")
             
@@ -2717,9 +3037,13 @@ def main():
             
             with drilldown_col2:
                 if bucket_type_choice == 'Percentage Variance':
-                    bucket_options = [b[0] for b in PERCENTAGE_BUCKETS]
+                    bucket_options = ['0% (Exact Match)', '0-10%', '10-20%', '20-40%', '40-60%', '60-80%', '80-100%', '>100%']
                 else:
-                    bucket_options = [b[0] for b in ABSOLUTE_BUCKETS]
+                    # Use appropriate buckets based on ingest type filter
+                    if ingest_type_filter == 'FULL Only':
+                        bucket_options = ['0 (Exact Match)', '1-100', '101-1K', '1K-10K', '10K-40K', '>40K (Critical)']
+                    else:
+                        bucket_options = ['0 (Exact Match)', '1-100', '101-1K', '1K-10K', '10K-100K', '100K-1M', '1M-10M', '10M-100M', '100M-1B', '>1B']
                 
                 selected_bucket = st.selectbox(
                     "Select Bucket to Drill Down",
@@ -2733,7 +3057,8 @@ def main():
                 filtered_variance, 
                 bucket_type=drilldown_type, 
                 selected_bucket=selected_bucket,
-                aggregate_by_dataset=aggregate_by_dataset
+                aggregate_by_dataset=aggregate_by_dataset,
+                ingest_type_filter=ingest_type_filter
             )
             
             record_type = "unique datasets" if aggregate_by_dataset else "partition date rows"
