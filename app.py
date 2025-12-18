@@ -2386,6 +2386,23 @@ def main():
                     new_source_partial = st.multiselect("New Source Type", options=df_partial[new_source_col].dropna().unique(), key="partial_new_source")
                 else:
                     new_source_partial = []
+            
+            # Filters - Row 3 (Actual Ingest Type filters)
+            col9, col10, col11, col12 = st.columns(4)
+            
+            with col9:
+                old_actual_ingest_col = next((c for c in ['Old Actual Ingest Type', 'old_actual_ingest_type', 'Old actual ingest type'] if c in df_partial.columns), None)
+                if old_actual_ingest_col:
+                    old_actual_ingest_partial = st.multiselect("Old Actual Ingest Type", options=df_partial[old_actual_ingest_col].dropna().unique(), key="partial_old_actual_ingest")
+                else:
+                    old_actual_ingest_partial = []
+            
+            with col10:
+                new_actual_ingest_col = next((c for c in ['New Actual Ingest Type', 'new_actual_ingest_type', 'New actual ingest type'] if c in df_partial.columns), None)
+                if new_actual_ingest_col:
+                    new_actual_ingest_partial = st.multiselect("New Actual Ingest Type", options=df_partial[new_actual_ingest_col].dropna().unique(), key="partial_new_actual_ingest")
+                else:
+                    new_actual_ingest_partial = []
         
         # Apply filters
         filtered_partial = df_partial.copy()
@@ -2406,6 +2423,11 @@ def main():
             filtered_partial = filtered_partial[filtered_partial[old_source_col].isin(old_source_partial)]
         if new_source_partial and new_source_col:
             filtered_partial = filtered_partial[filtered_partial[new_source_col].isin(new_source_partial)]
+        # Actual Ingest Type filters
+        if old_actual_ingest_partial and old_actual_ingest_col:
+            filtered_partial = filtered_partial[filtered_partial[old_actual_ingest_col].isin(old_actual_ingest_partial)]
+        if new_actual_ingest_partial and new_actual_ingest_col:
+            filtered_partial = filtered_partial[filtered_partial[new_actual_ingest_col].isin(new_actual_ingest_partial)]
         
         # Add Next Steps Suggested column based on case
         if reason_col and reason_col in filtered_partial.columns:
@@ -2523,6 +2545,23 @@ def main():
                     new_source_notok = st.multiselect("New Source Type", options=df_not_ok[new_source_col_notok].dropna().unique(), key="notok_new_source")
                 else:
                     new_source_notok = []
+            
+            # Filters - Row 3 (Actual Ingest Type filters)
+            col9, col10, col11, col12 = st.columns(4)
+            
+            with col9:
+                old_actual_ingest_col_notok = next((c for c in ['Old Actual Ingest Type', 'old_actual_ingest_type', 'Old actual ingest type'] if c in df_not_ok.columns), None)
+                if old_actual_ingest_col_notok:
+                    old_actual_ingest_notok = st.multiselect("Old Actual Ingest Type", options=df_not_ok[old_actual_ingest_col_notok].dropna().unique(), key="notok_old_actual_ingest")
+                else:
+                    old_actual_ingest_notok = []
+            
+            with col10:
+                new_actual_ingest_col_notok = next((c for c in ['New Actual Ingest Type', 'new_actual_ingest_type', 'New actual ingest type'] if c in df_not_ok.columns), None)
+                if new_actual_ingest_col_notok:
+                    new_actual_ingest_notok = st.multiselect("New Actual Ingest Type", options=df_not_ok[new_actual_ingest_col_notok].dropna().unique(), key="notok_new_actual_ingest")
+                else:
+                    new_actual_ingest_notok = []
         
         # Apply filters
         filtered_notok = df_not_ok.copy()
@@ -2543,6 +2582,11 @@ def main():
             filtered_notok = filtered_notok[filtered_notok[old_source_col_notok].isin(old_source_notok)]
         if new_source_notok and new_source_col_notok:
             filtered_notok = filtered_notok[filtered_notok[new_source_col_notok].isin(new_source_notok)]
+        # Actual Ingest Type filters
+        if old_actual_ingest_notok and old_actual_ingest_col_notok:
+            filtered_notok = filtered_notok[filtered_notok[old_actual_ingest_col_notok].isin(old_actual_ingest_notok)]
+        if new_actual_ingest_notok and new_actual_ingest_col_notok:
+            filtered_notok = filtered_notok[filtered_notok[new_actual_ingest_col_notok].isin(new_actual_ingest_notok)]
         
         # Display count
         unique_datasets = filtered_notok['Dataset ID'].nunique() if 'Dataset ID' in filtered_notok.columns else len(filtered_notok)
